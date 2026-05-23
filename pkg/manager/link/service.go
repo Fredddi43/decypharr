@@ -183,6 +183,7 @@ func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.E
 // cycle. Logged once per call.
 func (s *Service) markEntryBad(entry *storage.Entry, filename string, attempt int, reason string) {
 	entry.Bad = true
+	entry.MarkAsError(fmt.Errorf("repeated failed re-insertions: %s", reason))
 	if s.entrySaver != nil {
 		if err := s.entrySaver(entry); err != nil {
 			s.logger.Warn().
