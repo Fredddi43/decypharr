@@ -1,0 +1,68 @@
+name: Sync fork with upstream
+
+# Runs daily and on demand. Keeps the fork's `main` perfectly in sync with
+# sirrobot01/decypharr's main, then rebases our `beta` branch (which carries
+# our local patches) on top. A successful run pushes to `beta`, which kicks
+# off `beta-docker.yml` and produces a fresh ghcr.io image automatically.
+#
+# If the rebase fails (conflict with new upstream code touching the same
+# region as one of our patches), the workflow fails loudly; we then resolve
+# the conflict manually and re-run.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # daily at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/sirrobot01/decypharr.git
+          git fetch upstream --tags
+
+      - name: Fast-forward main to upstream/main
+        run: |
+          git checkout main
+          if git merge --ff-only upstream/main; then
+            echo "main fast-forwarded"
+          else
+            echo "::error::main has diverged from upstream/main; aborting"
+            exit 1
+          fi
+          git push origin main --tags
+
+      - name: Rebase beta onto refreshed main
+        id: rebase
+        run: |
+          git checkout beta
+          if git rebase main; then
+            echo "beta rebased cleanly"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            git rebase --abort || true
+            echo "::error::beta rebase has conflicts with new upstream; manual rebase required"
+            exit 1
+          fi
+
+      - name: Push beta (force-with-lease — fork branch only)
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          git push origin beta --force-with-lease
+          echo "Push to beta will trigger beta-docker.yml automatically"
