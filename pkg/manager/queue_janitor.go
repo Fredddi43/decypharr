@@ -245,16 +245,18 @@ func (j *QueueJanitor) runPass(ctx context.Context) {
 // arr has been notified (or if it has no record of the grab), the entry
 // is removed from Decypharr's queue.
 //
-// We respect the same grace + cooldown + max-per-run knobs as the arr
-// sweep: error entries within the grace window get a chance to settle
-// (rare for genuine debrid rejections, but cheap insurance), entries we
-// already acted on stay in the cooldown set, and a single pass is capped
-// at maxPerRun deletes.
+// Unlike the arr-side sweep we DO NOT apply the grace window here. The
+// entry is already in state=error because every configured debrid
+// returned a hard error (DMCA 451, TorBox 400, "torrent not found", …);
+// there is nothing to "settle" — the magnet isn't coming back. We still
+// honour cooldown (don't hammer the same hash) and max-per-run.
 func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr, now, graceCutoff time.Time) {
+	_ = graceCutoff // intentionally unused: error entries don't need to settle
 	errored := j.manager.queue.ListFilter("", config.ProtocolAll, storage.EntryStateError, nil, "", true)
 	if len(errored) == 0 {
 		return
 	}
+	j.logger.Debug().Int("error_entries", len(errored)).Msg("Decypharr error sweep starting")
 
 	// Build a quick name → arr map so we can route entries by category.
 	arrByName := make(map[string]*arr.Arr, len(arrs))
@@ -273,9 +275,6 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 			break
 		}
 		if entry == nil {
-			continue
-		}
-		if !entry.AddedOn.IsZero() && entry.AddedOn.After(graceCutoff) {
 			continue
 		}
 
