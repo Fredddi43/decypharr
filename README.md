@@ -125,6 +125,27 @@ Toggle via the UI (General Settings → Symlink File Naming) or env
 upstream behaviour (useful if your debrid consistently ships better
 names than the release name itself).
 
+### Skip extra files in multi-file packs
+
+Anime BD-rip season packs (and some BluRay remuxes) ship with a pile of
+non-episode files alongside the actual episodes — PV trailers,
+Creditless OPs/EDs (NCED/NCOP), BD menus, samples, bonuses,
+interviews. Sonarr/Radarr can't import these, but their import scan
+still runs ffprobe against every file in the folder, which generates
+log noise and, on a FUSE-backed mount, can stall the import behind I/O
+errors on uncached files.
+
+`skip_extra_files: true` (default) filters these out at the symlink
+layer — the arr never sees them. Built-in pattern matches PV,
+Creditless, NCED, NCOP, BD Menu, DVD Menu, Sample, Trailer, Bonus,
+Extra, Featurette, Promo, Teaser, Interview (case-insensitive, matched
+against the file basename). Add custom patterns via
+`extra_file_patterns` for unusual release group conventions.
+
+Only applied to multi-file releases. Single-file releases (one mkv =
+the whole release) are never filtered. Toggle via the UI or env
+`DECYPHARR_SKIP_EXTRA_FILES=false`.
+
 ### `markEntryBad` error propagation (existing fork patch)
 
 When repeated re-insertion attempts fail, the qBit-compat API now reports

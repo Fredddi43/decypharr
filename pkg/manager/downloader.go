@@ -228,9 +228,35 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) erro
 }
 
 func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, files []*storage.File, mountPath string, symlinkDir string) ([]string, error) {
+	cfg := config.Get()
+
+	// SkipExtraFiles: filter out non-episode files (PV / Creditless /
+	// NCED / NCOP / BD Menu / Sample / Trailer / Bonus / Extra) from
+	// multi-file packs so the arr's import scan doesn't waste ffprobe
+	// calls on junk and the library stays clean. Single-file releases
+	// are never filtered (one mkv = the episode).
+	skipExtras := cfg.SkipExtraFiles == nil || *cfg.SkipExtraFiles
+	extraPatterns := cfg.ExtraFilePatterns
+	skippedExtras := 0
+
 	remainingFiles := make(map[string]*storage.File, len(files))
 	for _, file := range files {
+		if skipExtras && len(files) > 1 && utils.IsExtraFile(file.Name, extraPatterns) {
+			skippedExtras++
+			d.logger.Debug().
+				Str("entry", entry.Name).
+				Str("skipped_file", file.Name).
+				Msg("Skipping extra file (PV/Creditless/Menu/etc.) — not symlinking")
+			continue
+		}
 		remainingFiles[file.Name] = file
+	}
+	if skippedExtras > 0 {
+		d.logger.Info().
+			Str("entry", entry.Name).
+			Int("skipped", skippedExtras).
+			Int("kept", len(remainingFiles)).
+			Msg("Filtered extra files from symlink set")
 	}
 
 	// Decide whether to rename the per-file symlink to the release name.
@@ -239,10 +265,9 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 	// m2ts) the inner names are usually parser-friendly and renaming en
 	// masse would lose episode/season metadata. Configurable via
 	// config.SymlinkFileNaming; defaults to "release".
-	cfg := config.Get()
 	renameSingleFile := cfg.SymlinkFileNaming != config.SymlinkFileNamingInner // empty / "release" / anything-not-inner = on
 	mediaFileCount := 0
-	for _, f := range files {
+	for _, f := range remainingFiles {
 		if utils.IsMediaFile(f.Name) {
 			mediaFileCount++
 		}

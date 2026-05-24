@@ -82,6 +82,10 @@ func (c *Config) applyEnvOverrides() {
 	if val := getEnv("SYMLINK_FILE_NAMING"); val != "" {
 		c.SymlinkFileNaming = SymlinkFileNamingMode(val)
 	}
+	if val := getEnv("SKIP_EXTRA_FILES"); val != "" {
+		b := parseBool(val)
+		c.SkipExtraFiles = &b
+	}
 	// Manager categories array
 	for i := 0; i < 100; i++ { // Support up to 100 categories
 		key := fmt.Sprintf("CATEGORIES__%d", i)

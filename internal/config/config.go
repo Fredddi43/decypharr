@@ -190,6 +190,17 @@ type Config struct {
 	Categories            []string                 `json:"categories,omitempty"`
 	FolderNaming          WebDavFolderNaming       `json:"folder_naming,omitempty"`
 	SymlinkFileNaming     SymlinkFileNamingMode    `json:"symlink_file_naming,omitempty"`
+	// SkipExtraFiles: when true (default), Decypharr filters out
+	// non-episode files inside multi-file packs — PVs, Creditless
+	// OPs/EDs, BD menus, samples, trailers, bonuses, extras — when
+	// building symlinks. Sonarr/Radarr never see those files, so they
+	// don't run ffprobe against junk during the import scan.
+	SkipExtraFiles      *bool    `json:"skip_extra_files,omitempty"`
+	// ExtraFilePatterns: regex patterns (case-insensitive, matched
+	// against the file basename) used in addition to the built-in
+	// defaults to identify "extra" files. Useful for unusual scene
+	// release group conventions.
+	ExtraFilePatterns   []string `json:"extra_file_patterns,omitempty"`
 	CustomFolders         map[string]CustomFolders `json:"custom_folders,omitempty"`
 	DefaultDownloadAction DownloadAction           `json:"default_download_action,omitempty"`
 
@@ -496,6 +507,16 @@ func (c *Config) setDefaults() {
 	// downloader for the single-file detection.
 	if c.SymlinkFileNaming == "" {
 		c.SymlinkFileNaming = SymlinkFileNamingRelease
+	}
+
+	// Default skip_extra_files = true. Filters out PV/Creditless/NCED
+	// /NCOP/BD-Menu/Sample/Trailer/Bonus/Extra/Featurette/Promo/Teaser
+	// /Interview files inside multi-file packs so Sonarr/Radarr don't
+	// ffprobe junk during import scans. *bool so an explicit false from
+	// the UI or env survives.
+	if c.SkipExtraFiles == nil {
+		t := true
+		c.SkipExtraFiles = &t
 	}
 
 	// Set default allowed extensions if not set in Manager

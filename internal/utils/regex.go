@@ -2,6 +2,7 @@ package utils
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -64,4 +65,46 @@ func IsMediaFile(path string) bool {
 	extLower := strings.ToLower(ext[1:])
 	_, ok := mediaExtensions[extLower]
 	return ok
+}
+
+// defaultExtraFileRegex matches common "extras" found inside multi-file
+// season packs and BD-rips — promos, creditless OPs/EDs, menus, samples,
+// trailers, interviews, etc. These files are not episodes and skipping
+// them when building symlinks keeps Sonarr/Radarr from running ffprobe
+// against junk during the import scan.
+//
+// Match against the basename of the file. Case-insensitive. Compiled
+// once at init for performance.
+var defaultExtraFileRegex = regexp.MustCompile(`(?i)` +
+	// Bracketed tags. Allows arbitrary prefix words inside the bracket
+	// (e.g. "[JPN BD Menu 07]", "[PV 06 - CVs]", "[Creditless Ending 01]")
+	// but requires a word boundary around the marker keyword to avoid
+	// matching things like "[Erai-raws]" against a substring.
+	`(\[[^\]]*\b(PV|NCED|NCOP|Creditless|BD[\s_-]?Menu|DVD[\s_-]?Menu|Sample|Trailer|Bonus|Extra|Featurette|Promo|Teaser|Interview)\b[^\]]*\])` +
+	// Standalone tag in the filename body. Conservative — only keywords
+	// that are virtually never part of a legitimate show/episode title.
+	`|(\b(NCED|NCOP|Creditless)\b)` +
+	// `*-sample.mkv` and the bare `sample.mkv`.
+	`|(-sample\.[a-z0-9]{2,4}$)` +
+	`|(^sample\b)`)
+
+// IsExtraFile reports whether the given filename matches any of the
+// supplied regex patterns. If patterns is empty, falls back to the
+// built-in defaultExtraFileRegex. Compiled regexes are cached per call
+// — for tight loops, callers should compile + reuse their own slice.
+func IsExtraFile(name string, patterns []string) bool {
+	base := filepath.Base(name)
+	if len(patterns) == 0 {
+		return defaultExtraFileRegex.MatchString(base)
+	}
+	for _, p := range patterns {
+		re, err := regexp.Compile(`(?i)` + p)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(base) {
+			return true
+		}
+	}
+	return false
 }
