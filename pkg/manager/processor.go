@@ -34,7 +34,19 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 			}
 			return nil
 		}
-		return fmt.Errorf("failed to submit torrent to debrid: %w", err)
+		// All configured debrids rejected the magnet (DMCA / 451, "file
+		// not available", quota exhausted with no fallback, …). Synthesise
+		// a queue entry in state=error so the qBit-compat /torrents/info
+		// surfaces it as an errored torrent — that lets the arr's built-in
+		// Failed Download Handling blocklist this specific release and
+		// search for a different one, instead of the arr seeing a
+		// connection-error and trying the same release again later.
+		if rejectErr := m.recordRejectedSubmission(importReq, err); rejectErr != nil {
+			m.logger.Warn().Err(rejectErr).Str("hash", importReq.Magnet.InfoHash).Msg("Failed to record rejected submission; the arr will see a client error and may retry the same release")
+			return fmt.Errorf("failed to submit torrent to debrid: %w", err)
+		}
+		m.logger.Warn().Err(err).Str("hash", importReq.Magnet.InfoHash).Str("name", importReq.Magnet.Name).Msg("All debrids rejected the magnet — queued as state=error so the arr can blocklist + re-search")
+		return nil
 	}
 
 	// Create managed torrent with InfoHash as primary key
@@ -403,6 +415,46 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 	}
 	joinedErrors := errors.Join(errs...)
 	return nil, fmt.Errorf("failed to process torrent: %w", joinedErrors)
+}
+
+// recordRejectedSubmission stores a minimal storage.Entry in state=error
+// for a magnet that every configured debrid refused to accept. The qBit-
+// compat /torrents/info will then expose it to the arr as a failed
+// download, triggering the arr's Failed Download Handling — which
+// blocklists the release and kicks off a fresh search for a different
+// one. Without this the arr just sees the qBit-compat /torrents/add
+// return an error and treats the whole thing as a transient client
+// problem (i.e. happily re-grabs the same release on the next sweep).
+func (m *Manager) recordRejectedSubmission(importReq *ImportRequest, submitErr error) error {
+	if importReq == nil || importReq.Magnet == nil || importReq.Arr == nil {
+		return fmt.Errorf("invalid import request for rejected-submission record")
+	}
+	now := time.Now()
+	entry := &storage.Entry{
+		InfoHash:         importReq.Magnet.InfoHash,
+		Name:             importReq.Magnet.Name,
+		OriginalFilename: importReq.Magnet.Name,
+		Protocol:         config.ProtocolTorrent,
+		Size:             importReq.Magnet.Size,
+		Bytes:            importReq.Magnet.Size,
+		Magnet:           importReq.Magnet.Link,
+		Category:         importReq.Arr.Name,
+		SavePath:         filepath.Join(importReq.DownloadFolder, importReq.Arr.Name),
+		Status:           debridTypes.TorrentStatusError,
+		Action:           importReq.Action,
+		DownloadUncached: false,
+		CallbackURL:      importReq.CallBackUrl,
+		SkipMultiSeason:  importReq.SkipMultiSeason,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		AddedOn:          now,
+		Providers:        make(map[string]*storage.ProviderEntry),
+		Files:            make(map[string]*storage.File),
+		Tags:             []string{"submission-rejected"},
+	}
+	entry.MarkAsError(submitErr) // sets State=EntryStateError, LastError, etc.
+	entry.ContentPath = entry.DownloadPath()
+	return m.queue.Add(entry)
 }
 
 // orderDebridClientsBySelection returns clients with the named one (if any)
