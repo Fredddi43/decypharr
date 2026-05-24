@@ -70,10 +70,14 @@ var defaultFailedPatterns = []string{
 	"file is locked",
 	"import failed",
 	"manual import required",
-	"matched to movie by id",
-	"matched to series by id",
 	"movie title mismatch",
 	"series title mismatch",
+	// Intentionally NOT matching "matched to (movie|series) by id".
+	// Upstream's queueFilter routes that case to ManualImport every 10s
+	// instead of blocklist+research — because the release IS the right
+	// item, just tracked under a different ID in the arr's grab history.
+	// Blocklisting would waste a debrid round-trip on a release we could
+	// have force-imported.
 }
 
 // defaultAlreadyHavePatterns drives the "already_have" verdict.
