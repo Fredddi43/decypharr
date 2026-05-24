@@ -86,6 +86,19 @@ Configured via the UI (Repair tab → Queue Janitor block) or env
 `_COOLDOWN_HOURS`, `_MAX_PER_RUN`). Default on, 30-min grace, 24-h
 cooldown, 25/run cap, sweeping every 5 minutes.
 
+Every pass also walks **Decypharr's own queue** for `state=error` entries
+(magnets every configured debrid rejected — DMCA / 451, quota exhausted
+with no fallback, etc.). For each it:
+
+1. looks up the matching grab in the arr's history by `downloadId`,
+2. POSTs `/api/v3/history/failed/<id>` so the arr blocklists the release
+   and triggers a fresh search for a different one,
+3. deletes the entry from Decypharr's qBit-compat queue.
+
+Without this, error entries pile up forever — the upstream `arr.Cleanup`
+flag isn't wired to anything in upstream code, so this sweep is the only
+way they drain.
+
 ### Symlink file naming
 
 Debrid archives often contain inner files with names that Sonarr/Radarr's

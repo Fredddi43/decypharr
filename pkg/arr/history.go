@@ -220,6 +220,44 @@ func (a *Arr) FindGrabHistoryID(mediaDBID int) (int, string, error) {
 	return r.ID, r.DownloadID, nil
 }
 
+// FindGrabHistoryByDownloadID returns the most recent "grabbed" history
+// record matching the given downloadId (qBit-compat infohash). Returns
+// (0, nil) when no grab record exists — e.g. history was trimmed, the
+// release was added outside an arr, or downloadId was never recorded
+// (older grabs from before the qBit-compat 400-bug fix). The arr stores
+// downloadIds uppercase; we pass the value through as-is and let the arr
+// match case-insensitively in its filter.
+func (a *Arr) FindGrabHistoryByDownloadID(downloadID string) (int, error) {
+	if a == nil {
+		return 0, fmt.Errorf("arr not configured")
+	}
+	if strings.TrimSpace(downloadID) == "" {
+		return 0, nil
+	}
+
+	query := gourl.Values{}
+	query.Add("page", "1")
+	query.Add("pageSize", "50")
+	query.Add("sortKey", "date")
+	query.Add("sortDirection", "descending")
+	query.Add("eventType", "1") // 1 = grabbed
+	query.Add("downloadId", strings.ToUpper(downloadID))
+
+	var data HistorySchema
+	url := "api/v3/history?" + query.Encode()
+	resp, err := a.Request(http.MethodGet, url, nil, &data)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("history lookup failed: %s", resp.Status)
+	}
+	if len(data.Records) == 0 {
+		return 0, nil
+	}
+	return data.Records[0].ID, nil
+}
+
 // MarkHistoryFailed marks a grab history record as failed. This blocklists
 // the release in the arr and, if redownload is enabled, triggers a re-search
 // for whatever is currently missing from that grab's scope.

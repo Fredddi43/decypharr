@@ -1,11 +1,12 @@
 // Queue Janitor — background sweep that cleans up stuck/redundant queue
-// entries in connected arr (Radarr/Sonarr) instances.
+// entries in connected arr (Radarr/Sonarr) instances **and** in
+// Decypharr's own qBit-compat queue.
 //
 // Replaces the external arr-stuck-import-handler.py sidecar. Decypharr
 // already holds arr clients (host + token) for the repair pipeline; reuse
 // that wiring instead of polling the arrs from outside the stack.
 //
-// Each queue entry is classified into one of three verdicts:
+// Each arr-queue entry is classified into one of three verdicts:
 //
 //   - "failed":         genuine bad release (parse error, unable-to-sample,
 //                       title mismatch, manual import required, …).
@@ -18,6 +19,19 @@
 //                       Sonarr's "Remove Completed Downloads" sometimes
 //                       doesn't fire when the download client is Decypharr.
 //                       Same drop-only DELETE as already_have.
+//
+// On the **Decypharr** side, every pass also sweeps state=error entries —
+// those are torrents every configured debrid refused to accept (DMCA / 451,
+// quota exhausted with no fallback, etc.). For each such entry we:
+//   1. Find the matching grab in the arr's history via downloadId,
+//   2. POST /api/v3/history/failed/<id> so the arr blocklists the release
+//      and triggers a fresh search for a different one,
+//   3. Delete the error entry from Decypharr so it stops cluttering the
+//      qBit-compat /torrents/info response.
+//
+// Without step 3 the entries just sit in Decypharr's queue forever —
+// the upstream `arr.Cleanup` flag is wired to nothing in upstream code,
+// so a separate sweep is the only way they drain.
 //
 // Cooldown state is kept in-memory only. On restart the set resets — that's
 // fine; re-DELETEing an already-removed queue id just returns 404 from the
@@ -38,6 +52,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // defaultFailedPatterns drives the "failed" verdict. Matched
@@ -217,6 +232,104 @@ func (j *QueueJanitor) runPass(ctx context.Context) {
 			continue
 		}
 		j.sweepArr(ctx, a, now, graceCutoff)
+	}
+
+	// Decypharr-side: drain state=error entries by blocklisting in the
+	// arr (so Failed Download Handling kicks in) and deleting the entry.
+	j.sweepDecypharrErrors(ctx, arrs, now, graceCutoff)
+}
+
+// sweepDecypharrErrors walks Decypharr's own queue for state=error entries
+// — magnets every configured debrid rejected — and asks the matching arr
+// to blocklist + re-search via POST /api/v3/history/failed/<id>. After the
+// arr has been notified (or if it has no record of the grab), the entry
+// is removed from Decypharr's queue.
+//
+// We respect the same grace + cooldown + max-per-run knobs as the arr
+// sweep: error entries within the grace window get a chance to settle
+// (rare for genuine debrid rejections, but cheap insurance), entries we
+// already acted on stay in the cooldown set, and a single pass is capped
+// at maxPerRun deletes.
+func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr, now, graceCutoff time.Time) {
+	errored := j.manager.queue.ListFilter("", config.ProtocolAll, storage.EntryStateError, nil, "", true)
+	if len(errored) == 0 {
+		return
+	}
+
+	// Build a quick name → arr map so we can route entries by category.
+	arrByName := make(map[string]*arr.Arr, len(arrs))
+	for _, a := range arrs {
+		if a != nil && a.Name != "" {
+			arrByName[strings.ToLower(a.Name)] = a
+		}
+	}
+
+	acted := 0
+	maxActs := j.maxPerRun()
+	blocklisted, dropped := 0, 0
+
+	for _, entry := range errored {
+		if acted >= maxActs {
+			break
+		}
+		if entry == nil {
+			continue
+		}
+		if !entry.AddedOn.IsZero() && entry.AddedOn.After(graceCutoff) {
+			continue
+		}
+
+		key := "decypharr:" + strings.ToLower(entry.InfoHash)
+		j.mu.Lock()
+		_, inCooldown := j.acted[key]
+		j.mu.Unlock()
+		if inCooldown {
+			continue
+		}
+
+		a := arrByName[strings.ToLower(entry.Category)]
+		if a != nil {
+			histID, err := a.FindGrabHistoryByDownloadID(entry.InfoHash)
+			if err != nil {
+				j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("history lookup failed")
+			} else if histID > 0 {
+				if err := a.MarkHistoryFailed(histID); err != nil {
+					j.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", histID).Str("hash", entry.InfoHash).Msg("MarkHistoryFailed failed; deleting Decypharr entry anyway")
+				} else {
+					blocklisted++
+				}
+			}
+		}
+
+		// Delete from Decypharr regardless of arr outcome. An error entry
+		// has no debrid placement and no symlinks to clean, so this is a
+		// pure metadata drop.
+		if err := j.manager.queue.Delete(entry.InfoHash, nil); err != nil && !strings.Contains(err.Error(), "not found") {
+			j.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Decypharr queue delete failed")
+			continue
+		}
+		dropped++
+
+		j.mu.Lock()
+		j.acted[key] = now
+		j.mu.Unlock()
+		acted++
+
+		j.logger.Info().
+			Str("hash", entry.InfoHash).
+			Str("category", entry.Category).
+			Str("name", truncate(entry.Name, 80)).
+			Str("reason", truncate(entry.LastError, 160)).
+			Msg("Drained Decypharr error entry")
+	}
+
+	if dropped > 0 || blocklisted > 0 {
+		j.logger.Info().
+			Int("error_entries", len(errored)).
+			Int("acted", acted).
+			Int("blocklisted_in_arr", blocklisted).
+			Int("deleted_from_decypharr", dropped).
+			Msg("Decypharr error sweep complete")
 	}
 }
 
