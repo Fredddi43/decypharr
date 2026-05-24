@@ -41,9 +41,21 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		// Failed Download Handling blocklist this specific release and
 		// search for a different one, instead of the arr seeing a
 		// connection-error and trying the same release again later.
+		//
+		// Critically: NEVER return an error from this path. Real qBittorrent
+		// always returns 200 OK from /api/v2/torrents/add — failures surface
+		// later via /torrents/info state polling. If we return an error here
+		// the qBit-compat handler returns HTTP 400, which Sonarr/Radarr
+		// interpret as "download client misconfigured, abort entirely" and
+		// they will refuse to even queue the grab (logged as "Failed to
+		// connect to qBittorrent, please check your settings"). That means
+		// no queue entry on the arr side → nothing for Failed Download
+		// Handling or our Queue Janitor to act on. Better to log the
+		// synthesis failure and return nil so the arr at least proceeds
+		// (and will retry later or eventually surface a stalled state).
 		if rejectErr := m.recordRejectedSubmission(importReq, err); rejectErr != nil {
-			m.logger.Warn().Err(rejectErr).Str("hash", importReq.Magnet.InfoHash).Msg("Failed to record rejected submission; the arr will see a client error and may retry the same release")
-			return fmt.Errorf("failed to submit torrent to debrid: %w", err)
+			m.logger.Warn().Err(rejectErr).Str("hash", importReq.Magnet.InfoHash).Str("name", importReq.Magnet.Name).Msg("Failed to record rejected submission; returning 200 anyway so the arr keeps tracking and can retry")
+			return nil
 		}
 		m.logger.Warn().Err(err).Str("hash", importReq.Magnet.InfoHash).Str("name", importReq.Magnet.Name).Msg("All debrids rejected the magnet — queued as state=error so the arr can blocklist + re-search")
 		return nil
