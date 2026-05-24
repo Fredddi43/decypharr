@@ -327,12 +327,16 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		Files:    make(map[string]debridTypes.File),
 	}
 
-	clients := m.FilterDebrid(func(c common.Client) bool {
-		if importRequest.SelectedDebrid != "" && c.Config().Name != importRequest.SelectedDebrid {
-			return false
-		}
-		return true
-	})
+	// Pull every configured debrid client. When an explicit SelectedDebrid
+	// is set we keep it at index 0 (so user/arr intent is honoured) but
+	// every other client follows as a fallback target — if the primary
+	// fails for *any* reason (rate limit, 5xx, network blip, "file not
+	// available"), the loop below tries the next one instead of failing
+	// the whole grab.
+	clients := orderDebridClientsBySelection(
+		m.FilterDebrid(func(c common.Client) bool { return true }),
+		importRequest.SelectedDebrid,
+	)
 
 	if len(clients) == 0 {
 		return nil, fmt.Errorf("no debrid clients available")
@@ -388,4 +392,27 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 	}
 	joinedErrors := errors.Join(errs...)
 	return nil, fmt.Errorf("failed to process torrent: %w", joinedErrors)
+}
+
+// orderDebridClientsBySelection returns clients with the named one (if any)
+// moved to index 0 while preserving the relative order of the rest. If
+// selected is empty or no match is found, the input slice is returned
+// unchanged.
+func orderDebridClientsBySelection(all []common.Client, selected string) []common.Client {
+	if selected == "" || len(all) == 0 {
+		return all
+	}
+	ordered := make([]common.Client, 0, len(all))
+	var pinned common.Client
+	for _, c := range all {
+		if pinned == nil && c.Config().Name == selected {
+			pinned = c
+			continue
+		}
+		ordered = append(ordered, c)
+	}
+	if pinned != nil {
+		return append([]common.Client{pinned}, ordered...)
+	}
+	return all
 }

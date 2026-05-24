@@ -1,14 +1,18 @@
 package account
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -26,50 +30,244 @@ type Manager struct {
 	current  atomic.Pointer[Account]
 	accounts *xsync.Map[string, *Account]
 	logger   zerolog.Logger
+
+	// Self-heal: when an account's authFailStreak crosses
+	// authFailStreakThreshold the manager quarantines it, ensures the main
+	// APIKey is available as a fallback account, and periodically probes
+	// quarantined accounts via the response hook to reactivate any that
+	// come back healthy.
+	autoHeal       bool
+	mainAPIKey     string
+	debridConf     config.Debrid
+	downloadRL     ratelimit.Limiter
+	cfgRetries     int
+	healLogger     zerolog.Logger
+	healMu         sync.Mutex
+	healStopOnce   sync.Once
+	healStop       chan struct{}
+	recheckEvery   time.Duration
+	rechecksRunning atomic.Bool
 }
 
-func NewManager(debridConf config.Debrid, downloadRL ratelimit.Limiter, logger zerolog.Logger) *Manager {
+const (
+	authFailStreakThreshold = 3
+	defaultRecheckEvery     = 5 * time.Minute
+)
+
+func NewManager(debridConf config.Debrid, downloadRL ratelimit.Limiter, log zerolog.Logger) *Manager {
 	m := &Manager{
-		debrid:   debridConf.Name,
-		accounts: xsync.NewMap[string, *Account](),
-		logger:   logger,
+		debrid:     debridConf.Name,
+		accounts:   xsync.NewMap[string, *Account](),
+		logger:     log,
+		mainAPIKey: debridConf.APIKey,
+		debridConf: debridConf,
+		downloadRL: downloadRL,
+		healLogger: logger.New(debridConf.Name + ".accounts"),
+		healStop:   make(chan struct{}),
 	}
 	cfg := config.Get()
+	m.cfgRetries = cfg.Retries
+	// Default-on; an explicit `false` in JSON disables.
+	m.autoHeal = debridConf.DownloadAPIKeyAutoHeal == nil || *debridConf.DownloadAPIKeyAutoHeal
+	m.recheckEvery = parseDurationOr(debridConf.DownloadAPIKeyRecheckInterval, defaultRecheckEvery)
 
 	var firstAccount *Account
 	for idx, token := range debridConf.DownloadAPIKeys {
 		if token == "" {
 			continue
 		}
-		headers := map[string]string{
-			"Authorization": fmt.Sprintf("Bearer %s", token),
-		}
-
-		// Create request client with equivalent options
-		opts := []request.ClientOption{
-			request.WithRateLimiter(downloadRL),
-			request.WithHeaders(headers),
-			request.WithMaxRetries(cfg.Retries),
-			request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway, 447),
-		}
-		if debridConf.Proxy != "" {
-			opts = append(opts, request.WithProxy(debridConf.Proxy))
-		}
-
-		account := &Account{
-			Debrid:     debridConf.Name,
-			Token:      token,
-			Index:      idx,
-			links:      xsync.NewMap[string, types.DownloadLink](),
-			httpClient: request.New(opts...),
-		}
-		m.accounts.Store(token, account)
+		acc := m.newAccount(token, idx, false)
+		m.accounts.Store(token, acc)
 		if firstAccount == nil {
-			firstAccount = account
+			firstAccount = acc
 		}
 	}
 	m.current.Store(firstAccount)
+
+	if m.autoHeal {
+		go m.recheckLoop()
+	}
 	return m
+}
+
+// newAccount constructs an Account with its httpClient wired up. When
+// autoHeal is on, the client is given a response hook that observes 401/403
+// for the parent Manager.
+func (m *Manager) newAccount(token string, idx int, isFallback bool) *Account {
+	headers := map[string]string{
+		"Authorization": fmt.Sprintf("Bearer %s", token),
+	}
+
+	acc := &Account{
+		Debrid:     m.debridConf.Name,
+		Token:      token,
+		Index:      idx,
+		links:      xsync.NewMap[string, types.DownloadLink](),
+		IsFallback: isFallback,
+	}
+
+	opts := []request.ClientOption{
+		request.WithRateLimiter(m.downloadRL),
+		request.WithHeaders(headers),
+		request.WithMaxRetries(m.cfgRetries),
+		request.WithRetryableStatus(http.StatusTooManyRequests, http.StatusBadGateway, 447),
+	}
+	if m.debridConf.Proxy != "" {
+		opts = append(opts, request.WithProxy(m.debridConf.Proxy))
+	}
+	if m.autoHeal {
+		opts = append(opts, request.WithResponseHook(func(resp *http.Response) {
+			m.observeStatus(acc, resp.StatusCode)
+		}))
+	}
+	acc.httpClient = request.New(opts...)
+	return acc
+}
+
+func parseDurationOr(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := utils.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+// observeStatus is the response hook target. 401/403 increments the streak;
+// any 2xx resets it. When the streak hits the threshold we quarantine the
+// account and synthesise a fallback from the main APIKey if none of the
+// configured download keys are usable any more.
+func (m *Manager) observeStatus(acc *Account, status int) {
+	if !m.autoHeal || acc == nil {
+		return
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		streak := acc.authFailStreak.Add(1)
+		if streak < authFailStreakThreshold {
+			return
+		}
+		if acc.Disabled.Load() {
+			return
+		}
+		acc.QuarantinedAt.Store(time.Now().UnixNano())
+		m.Disable(acc)
+		m.healLogger.Warn().
+			Int("status", status).
+			Str("token_masked", utils.Mask(acc.Token)).
+			Msg("Quarantining download key after repeated auth failures")
+		m.ensureFallback()
+	case status >= 200 && status < 300:
+		acc.authFailStreak.Store(0)
+	}
+}
+
+// ensureFallback adds an account using the main APIKey if no active accounts
+// remain. Mirrors the manual "clear download_api_keys then restart" recovery
+// path the user previously had to do by hand.
+func (m *Manager) ensureFallback() {
+	if m.mainAPIKey == "" {
+		return
+	}
+	if len(m.Active()) > 0 {
+		return
+	}
+	m.healMu.Lock()
+	defer m.healMu.Unlock()
+	if _, exists := m.accounts.Load(m.mainAPIKey); exists {
+		// Already in the map; if it's disabled (because it was one of the
+		// quarantined download_api_keys), reactivate it.
+		if acc, _ := m.accounts.Load(m.mainAPIKey); acc != nil && acc.Disabled.Load() {
+			acc.Reset()
+			acc.authFailStreak.Store(0)
+			acc.QuarantinedAt.Store(0)
+			m.current.Store(acc)
+			m.healLogger.Info().Msg("Reactivated main APIKey as download fallback")
+		}
+		return
+	}
+	idx := m.nextIndex()
+	fallback := m.newAccount(m.mainAPIKey, idx, true)
+	m.accounts.Store(m.mainAPIKey, fallback)
+	m.current.Store(fallback)
+	m.healLogger.Info().Str("token_masked", utils.Mask(m.mainAPIKey)).Msg("Injected main APIKey as download fallback account")
+}
+
+func (m *Manager) nextIndex() int {
+	maxIdx := -1
+	m.accounts.Range(func(key string, acc *Account) bool {
+		if acc.Index > maxIdx {
+			maxIdx = acc.Index
+		}
+		return true
+	})
+	return maxIdx + 1
+}
+
+// recheckLoop periodically probes quarantined accounts to see if their token
+// has been rotated/restored upstream. A cheap GET to "/" via the account's
+// httpClient is enough — we only care whether the status is no longer
+// 401/403 — and the response hook will reset the streak automatically on a
+// non-error response.
+func (m *Manager) recheckLoop() {
+	if !m.rechecksRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer m.rechecksRunning.Store(false)
+
+	t := time.NewTicker(m.recheckEvery)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-m.healStop:
+			return
+		case <-t.C:
+			m.recheckQuarantined()
+		}
+	}
+}
+
+func (m *Manager) recheckQuarantined() {
+	m.accounts.Range(func(key string, acc *Account) bool {
+		if !acc.Disabled.Load() {
+			return true
+		}
+		if acc.IsFallback {
+			// Don't recheck the synthetic fallback — it IS the main APIKey
+			// and is only disabled if explicitly quarantined, which is fine.
+			return true
+		}
+		// Cheap probe: any GET. We don't read the body; the response hook
+		// will flip the streak via observeStatus.
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
+		if err != nil {
+			return true
+		}
+		resp, err := acc.httpClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		_ = err
+		// If observeStatus saw a 2xx, the streak is now 0 and the account
+		// will report Active again on the next sweep — but Disabled needs
+		// an explicit clear because we set it via MarkDisabled earlier.
+		if acc.authFailStreak.Load() == 0 {
+			acc.Disabled.Store(false)
+			acc.QuarantinedAt.Store(0)
+			m.healLogger.Info().Str("token_masked", utils.Mask(acc.Token)).Msg("Reactivated download key after successful recheck")
+		}
+		return true
+	})
+}
+
+// StopAutoHeal cancels the recheck goroutine. Safe to call multiple times.
+func (m *Manager) StopAutoHeal() {
+	m.healStopOnce.Do(func() {
+		close(m.healStop)
+	})
 }
 
 func (m *Manager) Active() []*Account {

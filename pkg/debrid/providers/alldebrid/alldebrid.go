@@ -30,6 +30,7 @@ type AllDebrid struct {
 	accountsManager       *account.Manager
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
+	submitClient          *request.Client // /magnet/upload, /magnet/upload/file — fast-fail on 429
 	Profile               *types.Profile `json:"profile"`
 	logger                zerolog.Logger
 	config                config.Debrid
@@ -55,6 +56,16 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*AllDebrid,
 		opts = append(opts, request.WithProxy(dc.Proxy))
 	}
 
+	submitOpts := []request.ClientOption{
+		request.WithHeaders(headers),
+		request.WithRateLimiter(ratelimits["submit"]),
+		request.WithMaxRetries(cfg.Retries),
+		request.WithRetryableStatus(http.StatusBadGateway), // no 429 retry on submit — fail fast for fallback
+	}
+	if dc.Proxy != "" {
+		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))
+	}
+
 	autoExpiresLinksAfter, err := utils.ParseDuration(dc.AutoExpireLinksAfter)
 	if autoExpiresLinksAfter == 0 || err != nil {
 		autoExpiresLinksAfter = 48 * time.Hour
@@ -65,6 +76,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*AllDebrid,
 		accountsManager:       account.NewManager(dc, ratelimits["download"], _log),
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
+		submitClient:          request.New(submitOpts...),
 		logger:                _log,
 		config:                dc,
 	}
@@ -113,8 +125,17 @@ func (ad *AllDebrid) doAccountRequest(account *account.Account, endpoint string,
 	return resp, nil
 }
 
-// doRequest performs a GET request and unmarshals the response
+// doRequest performs a GET request and unmarshals the response.
 func (ad *AllDebrid) doRequest(endpoint string, queryParams map[string]string, result interface{}) (*http.Response, error) {
+	return ad.doRequestVia(ad.client, endpoint, queryParams, result)
+}
+
+// doSubmitRequest routes through submitClient (separate "submit" bucket, no 429 retry).
+func (ad *AllDebrid) doSubmitRequest(endpoint string, queryParams map[string]string, result interface{}) (*http.Response, error) {
+	return ad.doRequestVia(ad.submitClient, endpoint, queryParams, result)
+}
+
+func (ad *AllDebrid) doRequestVia(c *request.Client, endpoint string, queryParams map[string]string, result interface{}) (*http.Response, error) {
 	u, err := url.Parse(ad.Host + endpoint)
 	if err != nil {
 		return nil, err
@@ -133,7 +154,7 @@ func (ad *AllDebrid) doRequest(endpoint string, queryParams map[string]string, r
 		return nil, err
 	}
 
-	resp, err := ad.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +176,7 @@ func (ad *AllDebrid) IsAvailable(hashes []string) map[string]bool {
 }
 
 func (ad *AllDebrid) doPostFile(endpoint string, fileData []byte, result interface{}) (*http.Response, error) {
+	// AllDebrid's torrent file upload is a submission — route through submitClient.
 	u, err := url.Parse(ad.Host + endpoint)
 	if err != nil {
 		return nil, err
@@ -177,7 +199,7 @@ func (ad *AllDebrid) doPostFile(endpoint string, fileData []byte, result interfa
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := ad.client.Do(req)
+	resp, err := ad.submitClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +248,7 @@ func (ad *AllDebrid) addTorrentFile(torrent *types.Torrent) (*types.Torrent, err
 func (ad *AllDebrid) addMagnetLink(torrent *types.Torrent) (*types.Torrent, error) {
 	var data UploadMagnetResponse
 
-	resp, err := ad.doRequest("/magnet/upload", map[string]string{"magnets[]": torrent.Magnet.Link}, &data)
+	resp, err := ad.doSubmitRequest("/magnet/upload", map[string]string{"magnets[]": torrent.Magnet.Link}, &data)
 	if err != nil {
 		return nil, err
 	}

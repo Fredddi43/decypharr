@@ -50,10 +50,15 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	mainRL := utils.ParseRateLimit(dc.RateLimit)
 	repairRL := utils.ParseRateLimit(cmp.Or(dc.RepairRateLimit, dc.RateLimit))
 	downloadRL := utils.ParseRateLimit(cmp.Or(dc.DownloadRateLimit, dc.RateLimit))
+	// submit bucket gates createtorrent / addMagnet / addTorrent specifically;
+	// providers like TorBox enforce a 60/hour cap on /createtorrent that the
+	// general rate_limit (e.g. 250/minute) doesn't model.
+	submitRL := utils.ParseRateLimit(cmp.Or(dc.SubmitRateLimit, dc.RateLimit))
 
 	rateLimits["main"] = mainRL
 	rateLimits["repair"] = repairRL
 	rateLimits["download"] = downloadRL
+	rateLimits["submit"] = submitRL
 
 	switch dc.Provider {
 	case "realdebrid":

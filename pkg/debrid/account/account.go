@@ -22,6 +22,11 @@ type Account struct {
 
 	// Account reactivation tracking
 	DisableCount atomic.Int32 `json:"disable_count"`
+
+	// Self-heal counters — see Manager.observeStatus.
+	authFailStreak atomic.Int32 // consecutive 401/403s observed via the response hook
+	QuarantinedAt  atomic.Int64 // unix nanos of quarantine entry; 0 when healthy
+	IsFallback     bool         // true if this account was synthesised from the main APIKey because all configured download_api_keys were quarantined
 }
 
 func (a *Account) Equals(other *Account) bool {

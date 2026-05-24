@@ -42,6 +42,7 @@ type Torbox struct {
 	accountsManager       *account.Manager
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
+	submitClient          *request.Client // for /api/torrents/createtorrent — separate rate-limit bucket; no 429 retry so fast-fail lets SendToDebrid fallback to the next provider
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -72,6 +73,21 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		opts = append(opts, request.WithProxy(dc.Proxy))
 	}
 
+	// Submit client uses the per-endpoint "submit" rate limit and crucially
+	// drops StatusTooManyRequests from the retryable set — when TorBox's
+	// 60/hour /createtorrent cap is exhausted we want SubmitMagnet to fail
+	// fast (~1s) so the manager-level fallback loop can try the next debrid
+	// instead of stalling Radarr/Sonarr through retryablehttp's backoff.
+	submitOpts := []request.ClientOption{
+		request.WithHeaders(headers),
+		request.WithRateLimiter(ratelimits["submit"]),
+		request.WithMaxRetries(cfg.Retries),
+		request.WithRetryableStatus(http.StatusBadGateway),
+	}
+	if dc.Proxy != "" {
+		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))
+	}
+
 	autoExpiresLinksAfter, err := utils.ParseDuration(dc.AutoExpireLinksAfter)
 	if autoExpiresLinksAfter == 0 || err != nil {
 		autoExpiresLinksAfter = 48 * time.Hour
@@ -84,6 +100,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		config:                dc,
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
+		submitClient:          request.New(submitOpts...),
 		logger:                _log,
 	}
 	return tb, nil
@@ -132,8 +149,18 @@ func (tb *Torbox) doGet(endpoint string, queryParams map[string]string, result i
 	return resp, nil
 }
 
-// doPostForm performs a POST request with form data
+// doPostForm performs a POST request with form data using the main client.
 func (tb *Torbox) doPostForm(endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
+	return tb.doPostFormVia(tb.client, endpoint, formData, result)
+}
+
+// doSubmitPostForm performs a POST via the dedicated submit client (separate
+// "submit" rate-limit bucket, no 429 retry — see New()).
+func (tb *Torbox) doSubmitPostForm(endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
+	return tb.doPostFormVia(tb.submitClient, endpoint, formData, result)
+}
+
+func (tb *Torbox) doPostFormVia(c *request.Client, endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
 	form := url.Values{}
 	for k, v := range formData {
 		form.Set(k, v)
@@ -145,7 +172,7 @@ func (tb *Torbox) doPostForm(endpoint string, formData map[string]string, result
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := tb.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +263,7 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		formData["add_only_if_cached"] = "true"
 	}
 
-	resp, err := tb.doPostForm("/api/torrents/createtorrent", formData, &data)
+	resp, err := tb.doSubmitPostForm("/api/torrents/createtorrent", formData, &data)
 	if err != nil {
 		return nil, err
 	}

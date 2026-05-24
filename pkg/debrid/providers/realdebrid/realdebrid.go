@@ -39,6 +39,7 @@ type RealDebrid struct {
 	accountsManager       *account.Manager
 	client                *request.Client
 	repairClient          *request.Client
+	submitClient          *request.Client // /torrents/addMagnet, /torrents/addTorrent — fast-fail on 429 so SendToDebrid can fall over to another debrid
 	autoExpiresLinksAfter time.Duration
 	logger                zerolog.Logger
 
@@ -82,6 +83,16 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		request.WithProxy(dc.Proxy),
 	}
 
+	// Submit client: dedicated rate-limit bucket, NO StatusTooManyRequests
+	// in the retryable set so 429s bubble up in ~1s and the SendToDebrid
+	// fallback loop can try the next provider instead of stalling Sonarr/Radarr.
+	submitOpts := []request.ClientOption{
+		request.WithHeaders(headers),
+		request.WithMaxRetries(cfg.Retries),
+		request.WithRateLimiter(ratelimits["submit"]),
+		request.WithProxy(dc.Proxy),
+	}
+
 	r := &RealDebrid{
 		Host:                  "https://api.real-debrid.com/rest/1.0",
 		APIKey:                dc.APIKey,
@@ -89,6 +100,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
 		repairClient:          request.New(repairOpts...),
+		submitClient:          request.New(submitOpts...),
 		logger:                logger.New(dc.Name),
 		rarSemaphore:          make(chan struct{}, 2),
 		config:                dc,
@@ -137,6 +149,15 @@ func (r *RealDebrid) doGet(endpoint string, result interface{}) (*http.Response,
 
 // doPost performs a POST request with form data
 func (r *RealDebrid) doPostForm(endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
+	return r.doPostFormVia(r.client, endpoint, formData, result)
+}
+
+// doSubmitPostForm routes through submitClient (separate "submit" bucket, no 429 retry).
+func (r *RealDebrid) doSubmitPostForm(endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
+	return r.doPostFormVia(r.submitClient, endpoint, formData, result)
+}
+
+func (r *RealDebrid) doPostFormVia(c *request.Client, endpoint string, formData map[string]string, result interface{}) (*http.Response, error) {
 	form := url.Values{}
 	for k, v := range formData {
 		form.Set(k, v)
@@ -148,7 +169,7 @@ func (r *RealDebrid) doPostForm(endpoint string, formData map[string]string, res
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := r.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +184,17 @@ func (r *RealDebrid) doPostForm(endpoint string, formData map[string]string, res
 	return resp, nil
 }
 
-// doPut performs a PUT request with body
+// doPut performs a PUT request with body using the main client.
 func (r *RealDebrid) doPut(endpoint string, body []byte, contentType string, result interface{}) (*http.Response, error) {
+	return r.doPutVia(r.client, endpoint, body, contentType, result)
+}
+
+// doSubmitPut routes through submitClient (used by addTorrent).
+func (r *RealDebrid) doSubmitPut(endpoint string, body []byte, contentType string, result interface{}) (*http.Response, error) {
+	return r.doPutVia(r.submitClient, endpoint, body, contentType, result)
+}
+
+func (r *RealDebrid) doPutVia(c *request.Client, endpoint string, body []byte, contentType string, result interface{}) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -178,7 +208,7 @@ func (r *RealDebrid) doPut(endpoint string, body []byte, contentType string, res
 		req.Header.Set("Content-Type", contentType)
 	}
 
-	resp, err := r.client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +494,7 @@ func (r *RealDebrid) SubmitMagnet(t *types.Torrent) (*types.Torrent, error) {
 func (r *RealDebrid) addTorrent(t *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetSchema
 
-	resp, err := r.doPut("/torrents/addTorrent", t.Magnet.File, "application/x-bittorrent", &data)
+	resp, err := r.doSubmitPut("/torrents/addTorrent", t.Magnet.File, "application/x-bittorrent", &data)
 	if err != nil {
 		return nil, err
 	}
@@ -487,7 +517,7 @@ func (r *RealDebrid) addMagnet(t *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetSchema
 
 	formData := map[string]string{"magnet": t.Magnet.Link}
-	resp, err := r.doPostForm("/torrents/addMagnet", formData, &data)
+	resp, err := r.doSubmitPostForm("/torrents/addMagnet", formData, &data)
 	if err != nil {
 		return nil, err
 	}

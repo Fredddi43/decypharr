@@ -101,6 +101,30 @@ class ConfigManager {
 
         // Load repair config
         this.populateRepairSettings(config.repair, config.arrs);
+
+        // Load queue janitor config (lives on the same Repair tab in the UI)
+        this.populateQueueJanitorSettings(config.queue_janitor);
+    }
+
+    populateQueueJanitorSettings(qj) {
+        if (!qj) qj = {};
+        const $ = (id) => document.getElementById(id);
+        if ($('queue_janitor.enabled')) $('queue_janitor.enabled').checked = !!qj.enabled;
+        if ($('queue_janitor.interval')) $('queue_janitor.interval').value = qj.interval || '';
+        if ($('queue_janitor.grace_minutes')) $('queue_janitor.grace_minutes').value = qj.grace_minutes || '';
+        if ($('queue_janitor.cooldown_hours')) $('queue_janitor.cooldown_hours').value = qj.cooldown_hours || '';
+        if ($('queue_janitor.max_per_run')) $('queue_janitor.max_per_run').value = qj.max_per_run || '';
+    }
+
+    collectQueueJanitorConfig() {
+        const $ = (id) => document.getElementById(id);
+        return {
+            enabled: $('queue_janitor.enabled')?.checked || false,
+            interval: $('queue_janitor.interval')?.value.trim() || '',
+            grace_minutes: parseInt($('queue_janitor.grace_minutes')?.value, 10) || 0,
+            cooldown_hours: parseInt($('queue_janitor.cooldown_hours')?.value, 10) || 0,
+            max_per_run: parseInt($('queue_janitor.max_per_run')?.value, 10) || 0,
+        };
     }
 
     populateRepairSettings(repair, arrs) {
@@ -481,10 +505,37 @@ class ConfigManager {
                                 <label class="label" for="debrid[${index}].download_rate_limit">
                                     <span class=" font-medium">Download Rate Limit</span>
                                 </label>
-                                <input type="text" class="input w-full" 
-                                       name="debrid[${index}].download_rate_limit" id="debrid[${index}].download_rate_limit" 
+                                <input type="text" class="input w-full"
+                                       name="debrid[${index}].download_rate_limit" id="debrid[${index}].download_rate_limit"
                                        placeholder="150/minute">
                                 <span class="text-sm opacity-70">API rate limit for download operations</span>
+                            </div>
+                            <div>
+                                <label class="label" for="debrid[${index}].submit_rate_limit">
+                                    <span class=" font-medium">Submit Rate Limit</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="debrid[${index}].submit_rate_limit" id="debrid[${index}].submit_rate_limit"
+                                       placeholder="60/hour (TorBox createtorrent quota)">
+                                <span class="text-sm opacity-70">API rate limit for torrent submission (createtorrent / addMagnet). Set to <code>60/hour</code> for TorBox to avoid HTTP 429. Falls back to the general Rate Limit when empty.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="debrid[${index}].download_api_key_auto_heal" class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" class="checkbox"
+                                           name="debrid[${index}].download_api_key_auto_heal" id="debrid[${index}].download_api_key_auto_heal"
+                                           checked>
+                                    <span class="font-medium">Auto-heal stale download keys</span>
+                                </label>
+                                <span class="text-sm opacity-70">When a configured download API key returns 401/403, quarantine it, fall back to the main API key, and periodically retry. Reactivates without restart when the key comes back.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="debrid[${index}].download_api_key_recheck_interval">
+                                    <span class=" font-medium">Auto-heal Recheck Interval</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="debrid[${index}].download_api_key_recheck_interval" id="debrid[${index}].download_api_key_recheck_interval"
+                                       placeholder="5m">
+                                <span class="text-sm opacity-70">How often to probe quarantined download keys. Default 5m.</span>
                             </div>
                             <div>
                                 <label class="label" for="debrid[${index}].proxy">
@@ -1171,7 +1222,10 @@ class ConfigManager {
             notifications: this.collectNotificationsConfig(),
 
             // Collect repair config
-            repair: this.collectRepairConfig()
+            repair: this.collectRepairConfig(),
+
+            // Collect queue janitor config
+            queue_janitor: this.collectQueueJanitorConfig(),
         };
     }
 
@@ -1257,6 +1311,9 @@ class ConfigManager {
             const rateLimitInput = getField('rate_limit');
             const repairRateLimitInput = getField('repair_rate_limit');
             const downloadRateLimitInput = getField('download_rate_limit');
+            const submitRateLimitInput = getField('submit_rate_limit');
+            const downloadKeyAutoHealInput = getField('download_api_key_auto_heal');
+            const downloadKeyRecheckIntervalInput = getField('download_api_key_recheck_interval');
             const minimumFreeSlotInput = getField('minimum_free_slot');
             const proxyInput = getField('proxy');
             const downloadUncachedInput = getField('download_uncached');
@@ -1288,6 +1345,15 @@ class ConfigManager {
                 add_samples: addSamplesInput.checked,
                 user_agent: userAgentInput.value
             };
+            if (submitRateLimitInput && submitRateLimitInput.value) {
+                debrid.submit_rate_limit = submitRateLimitInput.value;
+            }
+            if (downloadKeyAutoHealInput) {
+                debrid.download_api_key_auto_heal = downloadKeyAutoHealInput.checked;
+            }
+            if (downloadKeyRecheckIntervalInput && downloadKeyRecheckIntervalInput.value) {
+                debrid.download_api_key_recheck_interval = downloadKeyRecheckIntervalInput.value;
+            }
 
             // Handle download API keys
             if (downloadKeysTextarea && downloadKeysTextarea.value.trim()) {

@@ -136,4 +136,30 @@ func (c *Config) applyEnvOverrides() {
 			}
 		}
 	}
+
+	c.applyQueueJanitorEnvVars()
+}
+
+func (c *Config) applyQueueJanitorEnvVars() {
+	if v := getEnv("QUEUE_JANITOR__ENABLED"); v != "" {
+		c.QueueJanitor.Enabled = parseBool(v)
+	}
+	if v := getEnv("QUEUE_JANITOR__INTERVAL"); v != "" {
+		c.QueueJanitor.Interval = v
+	}
+	if v := getEnv("QUEUE_JANITOR__GRACE_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.GraceMinutes = n
+		}
+	}
+	if v := getEnv("QUEUE_JANITOR__COOLDOWN_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.CooldownHours = n
+		}
+	}
+	if v := getEnv("QUEUE_JANITOR__MAX_PER_RUN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.MaxPerRun = n
+		}
+	}
 }

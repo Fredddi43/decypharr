@@ -59,6 +59,9 @@ type Manager struct {
 	fixer *Fixer
 	ctx   context.Context
 
+	// arr queue cleanup (replaces external arr-stuck-import-handler sidecar)
+	queueJanitor *QueueJanitor
+
 	customFolders *CustomFolders
 	mountManager  MountManager
 
@@ -232,6 +235,10 @@ func (m *Manager) init() {
 
 	// Initialize repair service. It registers with the scheduler in StartWorker.
 	m.repair = NewRepair(m)
+
+	// Initialize the queue janitor (arr queue cleanup, fka the
+	// arr-stuck-import-handler sidecar). Lifecycle is in Start/Stop.
+	m.queueJanitor = NewQueueJanitor(m)
 }
 
 func (m *Manager) initUsenet() {
@@ -395,6 +402,14 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}
 
+	// Kick off the queue janitor. Non-fatal if it fails — the rest of the
+	// manager is fine without it.
+	if m.queueJanitor != nil {
+		if err := m.queueJanitor.Start(ctx); err != nil {
+			m.logger.Warn().Err(err).Msg("Queue Janitor failed to start")
+		}
+	}
+
 	return nil
 }
 
@@ -430,6 +445,9 @@ func (m *Manager) Stop() error {
 		}
 	}
 
+	if m.queueJanitor != nil {
+		m.queueJanitor.Stop()
+	}
 	if m.repair != nil {
 		m.repair.Stop()
 	}

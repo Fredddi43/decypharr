@@ -28,6 +28,7 @@ type DebridLink struct {
 	accountsManager  *account.Manager
 	DownloadUncached bool
 	client           *request.Client
+	submitClient     *request.Client // /seedbox/add — fast-fail on 429 for fallback
 
 	autoExpiresLinksAfter time.Duration
 	logger                zerolog.Logger
@@ -57,6 +58,16 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*DebridLink
 		opts = append(opts, request.WithProxy(dc.Proxy))
 	}
 
+	submitOpts := []request.ClientOption{
+		request.WithHeaders(headers),
+		request.WithRateLimiter(ratelimits["submit"]),
+		request.WithMaxRetries(cfg.Retries),
+		request.WithRetryableStatus(http.StatusBadGateway), // no 429 retry on submit
+	}
+	if dc.Proxy != "" {
+		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))
+	}
+
 	autoExpiresLinksAfter, err := utils.ParseDuration(dc.AutoExpireLinksAfter)
 	if autoExpiresLinksAfter == 0 || err != nil {
 		autoExpiresLinksAfter = 48 * time.Hour
@@ -68,6 +79,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*DebridLink
 		DownloadUncached:      dc.DownloadUncached,
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
+		submitClient:          request.New(submitOpts...),
 		logger:                log,
 		config:                dc,
 	}
@@ -298,7 +310,7 @@ func (dl *DebridLink) SubmitMagnet(t *types.Torrent) (*types.Torrent, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := dl.client.Do(req)
+	resp, err := dl.submitClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

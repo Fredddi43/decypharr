@@ -1379,6 +1379,63 @@
                                 <span class="label-text font-medium">Notify on completion</span>
                             </label>
                         </div>
+
+                        <div class="divider"></div>
+
+                        <div>
+                            <h3 class="font-medium text-lg mb-2">Queue Janitor</h3>
+                            <p class="opacity-70 text-sm mb-4">
+                                Periodically inspects each connected arr's download queue and clears entries that are clearly stuck —
+                                releases that can't be parsed, items where the file is already imported but not removed, and downloads
+                                that aren't an upgrade over what's already on disk. Replaces the external arr-stuck-import-handler sidecar.
+                            </p>
+                        </div>
+
+                        <div>
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-lg checkbox-primary"
+                                       id="queue_janitor.enabled" name="queue_janitor.enabled">
+                                <div>
+                                    <span class="label-text font-medium text-lg">Enable Queue Janitor</span>
+                                    <div class="label-text-alt">Auto-clean stuck / redundant arr queue entries.</div>
+                                </div>
+                            </label>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div>
+                                <label class="label" for="queue_janitor.interval">
+                                    <span class="font-medium">Interval</span>
+                                </label>
+                                <input type="text" class="input w-full" name="queue_janitor.interval" id="queue_janitor.interval"
+                                       placeholder="10m">
+                                <span class="label-text-alt opacity-70">How often the janitor sweeps the arr queues.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="queue_janitor.grace_minutes">
+                                    <span class="font-medium">Grace (minutes)</span>
+                                </label>
+                                <input type="number" min="0" class="input w-full" name="queue_janitor.grace_minutes" id="queue_janitor.grace_minutes"
+                                       placeholder="60">
+                                <span class="label-text-alt opacity-70">Skip entries younger than this — gives the arr a chance to import naturally.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="queue_janitor.cooldown_hours">
+                                    <span class="font-medium">Cooldown (hours)</span>
+                                </label>
+                                <input type="number" min="0" class="input w-full" name="queue_janitor.cooldown_hours" id="queue_janitor.cooldown_hours"
+                                       placeholder="24">
+                                <span class="label-text-alt opacity-70">Don't re-process the same queue id within this window.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="queue_janitor.max_per_run">
+                                    <span class="font-medium">Max per run</span>
+                                </label>
+                                <input type="number" min="1" class="input w-full" name="queue_janitor.max_per_run" id="queue_janitor.max_per_run"
+                                       placeholder="10">
+                                <span class="label-text-alt opacity-70">Per-arr cap each pass so the janitor doesn't thunder against arr APIs.</span>
+                            </div>
+                        </div>
                     </div>
                 </div>
 

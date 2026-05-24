@@ -179,6 +179,30 @@ type Config struct {
 	SkipAutoMove bool   `json:"skip_auto_move,omitempty"`
 
 	Repair RepairConfig `json:"repair,omitzero"`
+
+	QueueJanitor QueueJanitorConfig `json:"queue_janitor,omitzero"`
+}
+
+// QueueJanitorConfig drives the background cleanup of stuck/redundant entries
+// in connected arr queues (replaces the external arr-stuck-import-handler
+// sidecar). The janitor classifies each queue record into one of three
+// verdicts: "failed" (blocklist + re-search), "already_have" (drop without
+// blocklist; the arr already has a better copy), or "imported_stale" (drop;
+// successfully imported but the queue entry was never removed).
+type QueueJanitorConfig struct {
+	Enabled             bool     `json:"enabled,omitempty"`               // default true
+	Interval            string   `json:"interval,omitempty"`              // default 10m
+	GraceMinutes        int      `json:"grace_minutes,omitempty"`         // default 60
+	CooldownHours       int      `json:"cooldown_hours,omitempty"`        // default 24
+	MaxPerRun           int      `json:"max_per_run,omitempty"`           // default 10
+	FailedPatterns      []string `json:"failed_patterns,omitempty"`       // override built-in defaults
+	AlreadyHavePatterns []string `json:"already_have_patterns,omitempty"` // override built-in defaults
+}
+
+func (q QueueJanitorConfig) IsZero() bool {
+	return !q.Enabled && q.Interval == "" && q.GraceMinutes == 0 &&
+		q.CooldownHours == 0 && q.MaxPerRun == 0 &&
+		len(q.FailedPatterns) == 0 && len(q.AlreadyHavePatterns) == 0
 }
 
 func (c *Config) JsonFile() string {
@@ -556,6 +580,29 @@ func (c *Config) setDefaults() {
 	}
 
 	c.applyRepairDefaults()
+	c.applyQueueJanitorDefaults()
+}
+
+func (c *Config) applyQueueJanitorDefaults() {
+	// Default: enabled, 10m interval, 60min grace, 24h cooldown, 10/run.
+	// Existing configs that don't mention queue_janitor at all should get
+	// the feature turned on; pre-existing JSON with an explicit block keeps
+	// whatever the user set.
+	if c.QueueJanitor.IsZero() {
+		c.QueueJanitor.Enabled = true
+	}
+	if c.QueueJanitor.Interval == "" {
+		c.QueueJanitor.Interval = "10m"
+	}
+	if c.QueueJanitor.GraceMinutes <= 0 {
+		c.QueueJanitor.GraceMinutes = 60
+	}
+	if c.QueueJanitor.CooldownHours <= 0 {
+		c.QueueJanitor.CooldownHours = 24
+	}
+	if c.QueueJanitor.MaxPerRun <= 0 {
+		c.QueueJanitor.MaxPerRun = 10
+	}
 }
 
 func (c *Config) applyRepairDefaults() {

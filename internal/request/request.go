@@ -39,6 +39,11 @@ type Client struct {
 	retryableStatus map[int]struct{}
 	logger          zerolog.Logger
 	proxy           string
+	// responseHook, if set, fires for every response (success and error)
+	// after retryablehttp has finished. Used by the account manager to
+	// observe 401/403 streaks per download key without instrumenting every
+	// provider call site.
+	responseHook func(*http.Response)
 }
 
 // WithMaxRetries sets the maximum number of retry attempts
@@ -105,6 +110,16 @@ func WithProxy(proxyURL string) ClientOption {
 	}
 }
 
+// WithResponseHook registers a callback invoked after every response (regardless of status).
+// The hook receives the *http.Response; do not read or close its body — that's
+// the caller's responsibility. Used for cross-cutting concerns like
+// authentication-failure tracking.
+func WithResponseHook(hook func(*http.Response)) ClientOption {
+	return func(c *Client) {
+		c.responseHook = hook
+	}
+}
+
 // Do performs an HTTP request with retries for certain status codes
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// Apply headers
@@ -132,7 +147,11 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("creating retryable request: %w", err)
 	}
 
-	return c.client.Do(retryReq)
+	resp, err := c.client.Do(retryReq)
+	if c.responseHook != nil && resp != nil {
+		c.responseHook(resp)
+	}
+	return resp, err
 }
 
 // MakeRequest performs an HTTP request and returns the response body as bytes

@@ -12,9 +12,10 @@ type Debrid struct {
 	APIKey                       string   `json:"api_key,omitempty"`
 	DownloadAPIKeys              []string `json:"download_api_keys,omitempty"`
 	DownloadUncached             bool     `json:"download_uncached,omitempty"`
-	RateLimit                    string   `json:"rate_limit,omitempty"` // 200/minute or 10/second
-	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"`
+	RateLimit                    string   `json:"rate_limit,omitempty"`        // general API ceiling (e.g. 250/minute)
+	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"` // repair sweep
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
+	SubmitRateLimit              string   `json:"submit_rate_limit,omitempty"` // createtorrent / addMagnet / addTorrent — set to 60/hour for TorBox
 	Proxy                        string   `json:"proxy,omitempty"`
 	UnpackRar                    bool     `json:"unpack_rar,omitempty"`
 	MinimumFreeSlot              int      `json:"minimum_free_slot,omitempty"` // Minimum active pots to use this debrid
@@ -24,6 +25,17 @@ type Debrid struct {
 	Workers                      int      `json:"workers,omitempty"`
 	AutoExpireLinksAfter         string   `json:"auto_expire_links_after,omitempty"`
 	UserAgent                    string   `json:"user_agent,omitempty"`
+
+	// Self-heal for stale download API keys.
+	// When a configured download_api_key starts returning 401/403, the
+	// account manager quarantines it (skips it for new requests), probes
+	// it periodically, and after a long bake removes it from the active
+	// list. When all keys are quarantined we fall back to the main APIKey
+	// so downloads keep flowing while you rotate the bad key.
+	DownloadAPIKeyAutoHeal           *bool  `json:"download_api_key_auto_heal,omitempty"`            // default true; explicit false disables
+	DownloadAPIKeyRecheckInterval    string `json:"download_api_key_recheck_interval,omitempty"`     // default 5m
+	DownloadAPIKeyRecheckMaxInterval string `json:"download_api_key_recheck_max_interval,omitempty"` // default 1h
+	DownloadAPIKeyRemoveAfter        string `json:"download_api_key_remove_after,omitempty"`         // default 24h
 
 	// Folder
 	Folder        string `json:"folder,omitempty"`          // Deprecated. Use Mount MountPath instead.
@@ -109,6 +121,31 @@ func (c *Config) applyDebridEnvVars() {
 			}
 			if proxy := getEnv(prefix + "PROXY"); proxy != "" {
 				c.Debrids[i].Proxy = proxy
+			}
+			if v := getEnv(prefix + "RATE_LIMIT"); v != "" {
+				c.Debrids[i].RateLimit = v
+			}
+			if v := getEnv(prefix + "REPAIR_RATE_LIMIT"); v != "" {
+				c.Debrids[i].RepairRateLimit = v
+			}
+			if v := getEnv(prefix + "DOWNLOAD_RATE_LIMIT"); v != "" {
+				c.Debrids[i].DownloadRateLimit = v
+			}
+			if v := getEnv(prefix + "SUBMIT_RATE_LIMIT"); v != "" {
+				c.Debrids[i].SubmitRateLimit = v
+			}
+			if v := getEnv(prefix + "DOWNLOAD_API_KEY_AUTO_HEAL"); v != "" {
+				b := parseBool(v)
+				c.Debrids[i].DownloadAPIKeyAutoHeal = &b
+			}
+			if v := getEnv(prefix + "DOWNLOAD_API_KEY_RECHECK_INTERVAL"); v != "" {
+				c.Debrids[i].DownloadAPIKeyRecheckInterval = v
+			}
+			if v := getEnv(prefix + "DOWNLOAD_API_KEY_RECHECK_MAX_INTERVAL"); v != "" {
+				c.Debrids[i].DownloadAPIKeyRecheckMaxInterval = v
+			}
+			if v := getEnv(prefix + "DOWNLOAD_API_KEY_REMOVE_AFTER"); v != "" {
+				c.Debrids[i].DownloadAPIKeyRemoveAfter = v
 			}
 		}
 	}
