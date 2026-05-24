@@ -97,12 +97,24 @@ quota exhausted with no fallback, etc.). For each it:
 3. deletes the entry from Decypharr's qBit-compat queue.
 
 **`state=pausedUP`** where the arr's history has a `downloadFolderImported`
-event for that hash (the arr is done with it). Decypharr just deletes the
-entry — the file's already in the library.
+event for that hash (the arr is done with it). Decypharr **hides** the
+entry from the qBit-compat response and the UI dashboard, but keeps it
+in storage so the FUSE mount keeps serving the file. The arr's library
+symlinks (when `default_download_action=symlink`) point back at
+`/mnt/decypharr/...` and remain valid forever; the repair sweep can
+still detect the entry if the debrid later drops it.
 
-Without these sweeps, both kinds of entries pile up forever — the
-upstream `arr.Cleanup` flag isn't wired to anything in upstream code, so
-these sweeps are the only way they drain.
+Gated on the **per-arr `Cleanup` flag** (UI: Cleanup;
+env: `DECYPHARR_ARRS__N__CLEANUP=true`). Default `false` for full
+backwards-compatibility — set `true` per-arr to opt into the tidy-queue
+behaviour. This wires meaningful semantics into a flag the upstream
+code defines but never reads.
+
+The `?include_hidden=true` query parameter on `/api/torrents` surfaces
+hidden entries if you ever need to inspect what was retired.
+
+Without these sweeps the `state=error` entries pile up forever (upstream
+has no equivalent path); the imported-paused hide is optional polish.
 
 ### Symlink file naming
 

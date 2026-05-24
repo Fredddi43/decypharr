@@ -233,6 +233,10 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
 	sortBy := strings.TrimSpace(r.URL.Query().Get("sort_by"))
 	sortOrder := strings.TrimSpace(r.URL.Query().Get("sort_order"))
+	// include_hidden=true surfaces entries the imported-paused sweep
+	// retired (still in storage + FUSE; just hidden from the default UI
+	// list). Defaults to false so the dashboard stays tidy.
+	includeHidden := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("include_hidden")), "true")
 
 	if sortBy == "" {
 		sortBy = "added_on"
@@ -250,6 +254,10 @@ func (s *Server) handleGetTorrents(w http.ResponseWriter, r *http.Request) {
 	// Apply filters
 	filteredTorrents := make([]*storage.Entry, 0)
 	for _, t := range allTorrents {
+		// Hide retired entries by default (see include_hidden above).
+		if t.Hidden && !includeHidden {
+			continue
+		}
 		// Search filter - search in name and hash
 		if search != "" {
 			searchIn := strings.ToLower(t.Name + " " + t.InfoHash)

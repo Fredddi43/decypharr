@@ -68,6 +68,14 @@ type Entry struct {
 
 	IsComplete bool `msgpack:"is_complete" json:"is_complete"` // Ready for use
 	Bad        bool `msgpack:"bad" json:"bad"`                 // Marked as bad/corrupted
+	// Hidden: when true the entry is omitted from qBit-compat
+	// /api/v2/torrents/info responses (so the arr stops polling it after
+	// import) and from the Decypharr UI's torrent list — but stays in
+	// storage, the FUSE mount keeps serving its files, and the repair
+	// sweep still inspects it. Used by the Queue Janitor's imported-paused
+	// sweep to retire entries the arr has already imported without
+	// breaking the symlink chain that powers Sonarr/Radarr libraries.
+	Hidden     bool `msgpack:"hidden,omitempty" json:"hidden,omitempty"`
 
 	// Metadata
 	Category    string   `msgpack:"category,omitempty" json:"category,omitempty"`         // Category (e.g., sonarr, radarr)

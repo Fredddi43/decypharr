@@ -89,6 +89,21 @@ func (q *QBit) handleTorrentsInfo(w http.ResponseWriter, r *http.Request) {
 	if filter != "" && filter != "all" {
 		torrents = filterByQBitState(torrents, filter)
 	}
+	// Hidden entries (e.g. retired by the imported-paused sweep) stay in
+	// storage so the FUSE mount keeps serving them, but are omitted from
+	// the qBit-compat response so the arr stops re-polling them on every
+	// tick. Hash-targeted queries still return hidden entries — the arr
+	// is asking about a specific download by id, so it deserves an
+	// honest answer.
+	if len(hashes) == 0 {
+		visible := torrents[:0]
+		for _, t := range torrents {
+			if !t.Hidden {
+				visible = append(visible, t)
+			}
+		}
+		torrents = visible
+	}
 	qbitTorrents := make([]Torrent, len(torrents))
 	for i, t := range torrents {
 		qbitTorrents[i] = convertToQBitTorrentTorrent(t)

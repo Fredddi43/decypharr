@@ -91,6 +91,13 @@ message EntryProto {
   int32 error_count = 37;
   int64 last_error_time_unix = 38;
   bool has_last_error_time = 39;
+
+  // Fork patch: when true the entry is omitted from qBit-compat
+  // /api/v2/torrents/info responses and from the Decypharr UI's torrent
+  // list, but stays in storage so the FUSE mount keeps serving its
+  // files. Used by Queue Janitor's imported-paused sweep to retire
+  // entries the arr has already imported without breaking symlinks.
+  bool hidden = 40;
 }
 
 // ============================================================================
