@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -196,10 +197,16 @@ func (q *Queue) Update(torrent *storage.Entry) error {
 }
 
 func (q *Queue) ListFilterFunc(category string, protocol config.Protocol, state storage.TorrentState, hashes []string) func(*storage.Entry) bool {
+	// Real qBittorrent matches infohash filters case-insensitively. Sonarr
+	// stores its downloadIds UPPERCASE and queries qBit-compat
+	// /api/v2/torrents/info with `hashes=<UPPER>|<UPPER>` — if we filter
+	// case-sensitively against Decypharr's lowercase InfoHash storage, the
+	// response is empty and Sonarr drops the tracked download. Normalise
+	// both sides to lowercase here.
 	hashSet := make(map[string]struct{}, len(hashes))
 	if len(hashes) > 0 {
 		for _, h := range hashes {
-			hashSet[h] = struct{}{}
+			hashSet[strings.ToLower(h)] = struct{}{}
 		}
 	}
 
@@ -213,7 +220,7 @@ func (q *Queue) ListFilterFunc(category string, protocol config.Protocol, state 
 				return false
 			}
 			if len(hashSet) > 0 {
-				if _, ok := hashSet[t.InfoHash]; !ok {
+				if _, ok := hashSet[strings.ToLower(t.InfoHash)]; !ok {
 					return false
 				}
 			}
