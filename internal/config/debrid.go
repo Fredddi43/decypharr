@@ -147,6 +147,9 @@ func (c *Config) applyDebridEnvVars() {
 			if v := getEnv(prefix + "DOWNLOAD_API_KEY_REMOVE_AFTER"); v != "" {
 				c.Debrids[i].DownloadAPIKeyRemoveAfter = v
 			}
+			if v := getEnv(prefix + "UNPACK_RAR"); v != "" {
+				c.Debrids[i].UnpackRar = parseBool(v)
+			}
 		}
 	}
 }
