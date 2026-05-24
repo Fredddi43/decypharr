@@ -14,6 +14,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"go.uber.org/ratelimit"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -50,25 +51,29 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	mainRL := utils.ParseRateLimit(dc.RateLimit)
 	repairRL := utils.ParseRateLimit(cmp.Or(dc.RepairRateLimit, dc.RateLimit))
 	downloadRL := utils.ParseRateLimit(cmp.Or(dc.DownloadRateLimit, dc.RateLimit))
-	// submit bucket gates createtorrent / addMagnet / addTorrent specifically;
-	// providers like TorBox enforce a 60/hour cap on /createtorrent that the
-	// general rate_limit (e.g. 250/minute) doesn't model.
-	submitRL := utils.ParseRateLimit(cmp.Or(dc.SubmitRateLimit, dc.RateLimit))
 
 	rateLimits["main"] = mainRL
 	rateLimits["repair"] = repairRL
 	rateLimits["download"] = downloadRL
-	rateLimits["submit"] = submitRL
+
+	// Submit bucket: a non-blocking limiter so a saturated provider quota
+	// (e.g. TorBox's 60/hour /createtorrent cap) yields ErrRateLimitExhausted
+	// immediately, letting SendToDebrid fall over to the next configured
+	// debrid instead of stalling the caller inside ratelimit.Take().
+	var submitAllow *rate.Limiter
+	if raw := cmp.Or(dc.SubmitRateLimit, dc.RateLimit); raw != "" {
+		submitAllow = utils.ParseNonBlockingRateLimit(raw)
+	}
 
 	switch dc.Provider {
 	case "realdebrid":
-		client, err = realdebrid.New(dc, rateLimits)
+		client, err = realdebrid.New(dc, rateLimits, submitAllow)
 	case "alldebrid":
-		client, err = alldebrid.New(dc, rateLimits)
+		client, err = alldebrid.New(dc, rateLimits, submitAllow)
 	case "torbox":
-		client, err = torbox.New(dc, rateLimits)
+		client, err = torbox.New(dc, rateLimits, submitAllow)
 	case "debridlink":
-		client, err = debridlink.New(dc, rateLimits)
+		client, err = debridlink.New(dc, rateLimits, submitAllow)
 	default:
 		return nil, ErrUnsupportedDebridProvider
 	}

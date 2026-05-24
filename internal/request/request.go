@@ -3,6 +3,7 @@ package request
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,7 +18,14 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"go.uber.org/ratelimit"
 	"golang.org/x/net/proxy"
+	"golang.org/x/time/rate"
 )
+
+// ErrRateLimitExhausted is returned from Do() when a non-blocking rate
+// limiter denies the request (bucket empty). Callers — primarily the
+// debrid provider submit clients — surface this error so SendToDebrid can
+// fall over to the next provider instead of stalling.
+var ErrRateLimitExhausted = errors.New("rate limit exhausted")
 
 var (
 	once     sync.Once
@@ -44,6 +52,12 @@ type Client struct {
 	// observe 401/403 streaks per download key without instrumenting every
 	// provider call site.
 	responseHook func(*http.Response)
+	// nonBlockingRL, if set, is consulted *before* the regular rateLimiter
+	// using Allow() — when its bucket is empty Do() returns
+	// ErrRateLimitExhausted immediately instead of sleeping. Used on debrid
+	// submit clients so a saturated quota triggers provider fallback rather
+	// than holding the calling goroutine open.
+	nonBlockingRL *rate.Limiter
 }
 
 // WithMaxRetries sets the maximum number of retry attempts
@@ -120,6 +134,19 @@ func WithResponseHook(hook func(*http.Response)) ClientOption {
 	}
 }
 
+// WithNonBlockingRateLimit attaches a non-blocking rate limiter
+// (golang.org/x/time/rate.Limiter). Unlike the default blocking limiter
+// installed by WithRateLimiter — which sleeps until a token arrives —
+// Do() checks Allow() on this limiter and returns ErrRateLimitExhausted
+// immediately when the bucket is empty. Provider submit clients use this
+// so a TorBox / RealDebrid quota burst causes a fast fall-through to the
+// next debrid instead of stalling Sonarr/Radarr's qBit-compat handler.
+func WithNonBlockingRateLimit(rl *rate.Limiter) ClientOption {
+	return func(c *Client) {
+		c.nonBlockingRL = rl
+	}
+}
+
 // Do performs an HTTP request with retries for certain status codes
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// Apply headers
@@ -131,7 +158,13 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 	c.headersMu.RUnlock()
 
-	// Apply rate limiting
+	// Non-blocking rate limit check (used by submit clients). If the
+	// bucket is empty, fail fast so the caller can switch debrids.
+	if c.nonBlockingRL != nil && !c.nonBlockingRL.Allow() {
+		return nil, ErrRateLimitExhausted
+	}
+
+	// Apply (blocking) rate limiting
 	if c.rateLimiter != nil {
 		select {
 		case <-req.Context().Done():

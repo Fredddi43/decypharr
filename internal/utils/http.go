@@ -13,29 +13,54 @@ import (
 	"time"
 
 	"go.uber.org/ratelimit"
+	"golang.org/x/time/rate"
 )
 
-func ParseRateLimit(rateStr string) ratelimit.Limiter {
+// parseRatePerSecond parses strings like "200/minute" or "5/second" and
+// returns the rate as events-per-second, plus the unit duration (used to
+// compute a sensible burst for non-blocking limiters). Returns (0, 0)
+// if the input is invalid.
+func parseRatePerSecond(rateStr string) (perSecond float64, count int) {
 	if rateStr == "" {
-		return nil
+		return 0, 0
 	}
 	parts := strings.SplitN(rateStr, "/", 2)
 	if len(parts) != 2 {
-		return nil
+		return 0, 0
 	}
-
-	// parse count
-	count, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if err != nil || count <= 0 {
-		return nil
+	n, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || n <= 0 {
+		return 0, 0
 	}
-
-	// Set slack size to 10%
-	slackSize := count / 10
-
-	// normalize unit
 	unit := strings.ToLower(strings.TrimSpace(parts[1]))
 	unit = strings.TrimSuffix(unit, "s")
+	var per time.Duration
+	switch unit {
+	case "minute", "min":
+		per = time.Minute
+	case "second", "sec":
+		per = time.Second
+	case "hour", "hr":
+		per = time.Hour
+	case "day", "d":
+		per = 24 * time.Hour
+	default:
+		return 0, 0
+	}
+	return float64(n) / per.Seconds(), n
+}
+
+func ParseRateLimit(rateStr string) ratelimit.Limiter {
+	perSec, count := parseRatePerSecond(rateStr)
+	if perSec <= 0 {
+		return nil
+	}
+	slackSize := count / 10
+
+	// Re-parse the unit so we can pick the right ratelimit.Per — the
+	// underlying library exposes events/duration not events/second.
+	parts := strings.SplitN(rateStr, "/", 2)
+	unit := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(parts[1]), "s"))
 	switch unit {
 	case "minute", "min":
 		return ratelimit.New(count, ratelimit.Per(time.Minute), ratelimit.WithSlack(slackSize))
@@ -48,6 +73,31 @@ func ParseRateLimit(rateStr string) ratelimit.Limiter {
 	default:
 		return nil
 	}
+}
+
+// ParseNonBlockingRateLimit returns a *rate.Limiter (golang.org/x/time/rate)
+// configured for the same target throughput as ParseRateLimit, suitable for
+// fast-fail Allow() checks. Used for the per-endpoint submit bucket: when
+// the bucket is empty the caller short-circuits instead of stalling its
+// goroutine inside ratelimit.Take() until a token arrives.
+//
+// Burst is set to `count` (matching the original ratelimit.New's
+// burst-via-slack behaviour) but capped at 60 so wildly large rates don't
+// produce absurd bucket sizes. Bucket starts full so cold-start
+// submissions go through immediately.
+func ParseNonBlockingRateLimit(rateStr string) *rate.Limiter {
+	perSec, count := parseRatePerSecond(rateStr)
+	if perSec <= 0 {
+		return nil
+	}
+	burst := count
+	if burst > 60 {
+		burst = 60
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return rate.NewLimiter(rate.Limit(perSec), burst)
 }
 
 func JSONResponse(w http.ResponseWriter, data interface{}, code int) {

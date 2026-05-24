@@ -15,7 +15,6 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.8.0
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/javi11/sevenzip v1.6.2-0.20251026160715-ca961b7f1239
-	github.com/melbahja/got v0.7.0
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -29,6 +28,7 @@ require (
 	golang.org/x/net v0.43.0
 	golang.org/x/sync v0.18.0
 	golang.org/x/sys v0.38.0
+	golang.org/x/time v0.0.0-20220609170525-579cf78fd858
 	google.golang.org/protobuf v1.36.7
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )

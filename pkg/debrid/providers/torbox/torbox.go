@@ -28,6 +28,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/version"
 	"go.uber.org/ratelimit"
+	"golang.org/x/time/rate"
 )
 
 var planSlots = map[string]int{
@@ -51,7 +52,7 @@ type Torbox struct {
 	downloadPresentLoaded bool
 }
 
-func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
+func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow *rate.Limiter) (*Torbox, error) {
 	cfg := config.Get()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
@@ -73,16 +74,22 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, er
 		opts = append(opts, request.WithProxy(dc.Proxy))
 	}
 
-	// Submit client uses the per-endpoint "submit" rate limit and crucially
-	// drops StatusTooManyRequests from the retryable set — when TorBox's
-	// 60/hour /createtorrent cap is exhausted we want SubmitMagnet to fail
-	// fast (~1s) so the manager-level fallback loop can try the next debrid
-	// instead of stalling Radarr/Sonarr through retryablehttp's backoff.
+	// Submit client routes /api/torrents/createtorrent through a dedicated
+	// fast-fail path:
+	//   - non-blocking rate limiter (Allow() → ErrRateLimitExhausted) so a
+	//     saturated quota yields an immediate error instead of stalling
+	//     inside Take() until a token arrives.
+	//   - StatusTooManyRequests dropped from retryablehttp's retryable
+	//     set, so TorBox's own 429 also fails fast.
+	// Either condition lets SendToDebrid move to the next debrid in ~1s
+	// without holding open Radarr/Sonarr's qBit-compat /torrents/add call.
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
-		request.WithRateLimiter(ratelimits["submit"]),
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRetryableStatus(http.StatusBadGateway),
+	}
+	if submitAllow != nil {
+		submitOpts = append(submitOpts, request.WithNonBlockingRateLimit(submitAllow))
 	}
 	if dc.Proxy != "" {
 		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))

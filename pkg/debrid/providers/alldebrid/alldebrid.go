@@ -22,6 +22,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"go.uber.org/ratelimit"
+	"golang.org/x/time/rate"
 )
 
 type AllDebrid struct {
@@ -36,7 +37,7 @@ type AllDebrid struct {
 	config                config.Debrid
 }
 
-func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*AllDebrid, error) {
+func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow *rate.Limiter) (*AllDebrid, error) {
 	cfg := config.Get()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
@@ -58,9 +59,11 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*AllDebrid,
 
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
-		request.WithRateLimiter(ratelimits["submit"]),
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRetryableStatus(http.StatusBadGateway), // no 429 retry on submit — fail fast for fallback
+	}
+	if submitAllow != nil {
+		submitOpts = append(submitOpts, request.WithNonBlockingRateLimit(submitAllow))
 	}
 	if dc.Proxy != "" {
 		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))

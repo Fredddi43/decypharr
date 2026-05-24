@@ -22,6 +22,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/debrid/common/rar"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"go.uber.org/ratelimit"
+	"golang.org/x/time/rate"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -50,7 +51,7 @@ type RealDebrid struct {
 	retries            int
 }
 
-func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid, error) {
+func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow *rate.Limiter) (*RealDebrid, error) {
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
 	}
@@ -83,14 +84,17 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		request.WithProxy(dc.Proxy),
 	}
 
-	// Submit client: dedicated rate-limit bucket, NO StatusTooManyRequests
-	// in the retryable set so 429s bubble up in ~1s and the SendToDebrid
-	// fallback loop can try the next provider instead of stalling Sonarr/Radarr.
+	// Submit client: fast-fail path for /torrents/addMagnet & addTorrent.
+	// Non-blocking rate limiter (Allow → ErrRateLimitExhausted) + 429
+	// dropped from the retryable set, so a saturated bucket OR an upstream
+	// 429 both surface in ~1s and SendToDebrid can try the next debrid.
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
 		request.WithMaxRetries(cfg.Retries),
-		request.WithRateLimiter(ratelimits["submit"]),
 		request.WithProxy(dc.Proxy),
+	}
+	if submitAllow != nil {
+		submitOpts = append(submitOpts, request.WithNonBlockingRateLimit(submitAllow))
 	}
 
 	r := &RealDebrid{
