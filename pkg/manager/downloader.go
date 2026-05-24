@@ -16,6 +16,7 @@ import (
 	grab "github.com/cavaliergopher/grab/v3"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sourcegraph/conc/pool"
@@ -232,6 +233,22 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 		remainingFiles[file.Name] = file
 	}
 
+	// Decide whether to rename the per-file symlink to the release name.
+	// Only applies to single-media-file releases (one mkv/m2ts/etc.) — for
+	// multi-file releases (TV episode packs, BDMV directories with many
+	// m2ts) the inner names are usually parser-friendly and renaming en
+	// masse would lose episode/season metadata. Configurable via
+	// config.SymlinkFileNaming; defaults to "release".
+	cfg := config.Get()
+	renameSingleFile := cfg.SymlinkFileNaming != config.SymlinkFileNamingInner // empty / "release" / anything-not-inner = on
+	mediaFileCount := 0
+	for _, f := range files {
+		if utils.IsMediaFile(f.Name) {
+			mediaFileCount++
+		}
+	}
+	releaseBase := strings.TrimSpace(utils.RemoveExtension(entry.Name))
+
 	filePaths := make([]string, 0, len(remainingFiles))
 	deadline := time.Now().Add(symlinkMountWaitTimeout)
 	delay := symlinkScanInitialInterval
@@ -254,13 +271,28 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 			fullPath := filepath.Join(dirPath, entryName)
 
 			if file, exists := remainingFiles[entryName]; exists {
-				fileSymlinkPath := filepath.Join(symlinkDir, file.Name)
+				symlinkName := file.Name
+				if renameSingleFile && mediaFileCount == 1 && utils.IsMediaFile(file.Name) && releaseBase != "" && releaseBase != "." && releaseBase != ".." {
+					// One-file release: replace the inner debrid filename
+					// (often something like 00000.m2ts or a truncated mkv)
+					// with the release name + the inner file's extension.
+					// Sonarr/Radarr parse the basename when ingesting, so
+					// matching their expected release name makes the
+					// difference between auto-import and "Unable to parse
+					// file" / "Manual Import required".
+					symlinkName = releaseBase + filepath.Ext(file.Name)
+				}
+				fileSymlinkPath := filepath.Join(symlinkDir, symlinkName)
 				if err := os.Symlink(fullPath, fileSymlinkPath); err != nil && !os.IsExist(err) {
 					return fmt.Errorf("failed to create symlink %s -> %s: %w", fileSymlinkPath, fullPath, err)
 				}
 				filePaths = append(filePaths, fileSymlinkPath)
 				delete(remainingFiles, entryName)
-				d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
+				if symlinkName == file.Name {
+					d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
+				} else {
+					d.logger.Info().Msgf("File is ready: %s/%s (renamed from %s)", entry.GetFolder(), symlinkName, file.Name)
+				}
 				continue
 			}
 

@@ -50,6 +50,24 @@ const (
 	WebdavUseHash              WebDavFolderNaming = "infohash"
 )
 
+// SymlinkFileNamingMode controls how Decypharr names each per-file symlink
+// it creates for the arrs. The folder layer is governed by FolderNaming;
+// this is the *inner* filename strategy.
+//
+//	release — single-file releases use the release name + the inner file's
+//	          extension. Multi-file releases (TV packs, BDMV directories)
+//	          keep the inner names. Defaults on so the qBit-compat output
+//	          is parser-friendly out of the box.
+//	inner   — preserve the inner filename verbatim (pre-patch behaviour).
+//	          Useful when the debrid archive is known to ship cleaner
+//	          names than the indexer's release title.
+type SymlinkFileNamingMode string
+
+const (
+	SymlinkFileNamingRelease SymlinkFileNamingMode = "release"
+	SymlinkFileNamingInner   SymlinkFileNamingMode = "inner"
+)
+
 var (
 	instance   *Config
 	once       sync.Once
@@ -171,6 +189,7 @@ type Config struct {
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
 	Categories            []string                 `json:"categories,omitempty"`
 	FolderNaming          WebDavFolderNaming       `json:"folder_naming,omitempty"`
+	SymlinkFileNaming     SymlinkFileNamingMode    `json:"symlink_file_naming,omitempty"`
 	CustomFolders         map[string]CustomFolders `json:"custom_folders,omitempty"`
 	DefaultDownloadAction DownloadAction           `json:"default_download_action,omitempty"`
 
@@ -471,6 +490,14 @@ func (c *Config) setDefaults() {
 		c.FolderNaming = WebDavFolderNaming(firstDebrid.FolderNaming)
 	}
 
+	// Default symlink file naming: rename single-file releases to match
+	// the indexer's release name (parser-friendly for arrs). Multi-file
+	// releases keep the inner debrid filenames either way — see the
+	// downloader for the single-file detection.
+	if c.SymlinkFileNaming == "" {
+		c.SymlinkFileNaming = SymlinkFileNamingRelease
+	}
+
 	// Set default allowed extensions if not set in Manager
 	if len(c.AllowedExt) == 0 {
 		c.AllowedExt = getDefaultExtensions()
@@ -584,24 +611,24 @@ func (c *Config) setDefaults() {
 }
 
 func (c *Config) applyQueueJanitorDefaults() {
-	// Default: enabled, 10m interval, 60min grace, 24h cooldown, 10/run.
-	// Existing configs that don't mention queue_janitor at all should get
-	// the feature turned on; pre-existing JSON with an explicit block keeps
-	// whatever the user set.
+	// Default: enabled, 5m interval, 30min grace, 24h cooldown, 25/run.
+	// Tightened from the initial (10m / 60m / 10) so the queue drains
+	// noticeably faster on a stack that's actively grabbing. Existing
+	// configs with explicit values for any field are preserved.
 	if c.QueueJanitor.IsZero() {
 		c.QueueJanitor.Enabled = true
 	}
 	if c.QueueJanitor.Interval == "" {
-		c.QueueJanitor.Interval = "10m"
+		c.QueueJanitor.Interval = "5m"
 	}
 	if c.QueueJanitor.GraceMinutes <= 0 {
-		c.QueueJanitor.GraceMinutes = 60
+		c.QueueJanitor.GraceMinutes = 30
 	}
 	if c.QueueJanitor.CooldownHours <= 0 {
 		c.QueueJanitor.CooldownHours = 24
 	}
 	if c.QueueJanitor.MaxPerRun <= 0 {
-		c.QueueJanitor.MaxPerRun = 10
+		c.QueueJanitor.MaxPerRun = 25
 	}
 }
 

@@ -301,6 +301,16 @@
                                             <span class="text-sm opacity-70">How to name folders in WebDAV</span>
                                         </div>
                                         <div>
+                                            <label class="label" for="symlink_file_naming">
+                                                <span class="font-medium">Symlink File Naming</span>
+                                            </label>
+                                            <select class="select w-full" name="symlink_file_naming" id="symlink_file_naming">
+                                                <option value="release">Release name (single-file releases)</option>
+                                                <option value="inner">Inner debrid filename (verbatim)</option>
+                                            </select>
+                                            <span class="text-sm opacity-70">For single-file releases, rename the symlink to the indexer's release name so Sonarr/Radarr can parse it. Multi-file releases (TV packs, BDMV directories) always keep their inner filenames either way.</span>
+                                        </div>
+                                        <div>
                                             <label class="label" for="refresh_dirs">
                                                 <span class="font-medium">Refresh Directories</span>
                                             </label>

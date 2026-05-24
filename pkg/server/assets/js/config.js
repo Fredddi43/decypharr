@@ -182,7 +182,7 @@ class ConfigManager {
             'min_file_size', 'max_file_size', 'remove_stalled_after',
             'nzb_user_agent', 'download_folder', 'refresh_interval',
             'max_downloads', 'skip_pre_cache', 'always_rm_tracker_urls',
-            'folder_naming', 'refresh_dirs', 'disable_webdav',
+            'folder_naming', 'symlink_file_naming', 'refresh_dirs', 'disable_webdav',
             'default_download_action', 'app_url'
         ];
 
@@ -1202,6 +1202,7 @@ class ConfigManager {
             skip_pre_cache: document.querySelector('[name="skip_pre_cache"]').checked,
             always_rm_tracker_urls: document.querySelector('[name="always_rm_tracker_urls"]').checked,
             folder_naming: document.querySelector('[name="folder_naming"]')?.value || "",
+            symlink_file_naming: document.querySelector('[name="symlink_file_naming"]')?.value || "",
             disable_webdav: document.querySelector('[name="disable_webdav"]').checked,
             refresh_dirs: document.querySelector('[name="refresh_dirs"]')?.value || "",
             custom_folders: this.collectVirtualFolders(),

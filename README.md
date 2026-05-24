@@ -18,6 +18,7 @@ Usenet streaming.
 - Automatic fallback to the next configured debrid when submission fails (rate limits, 5xx, network)
 - Self-healing for stale `download_api_keys` — quarantines failing keys, falls back to the main API key, periodically re-probes
 - Built-in **Queue Janitor** that cleans up stuck / redundant arr queue entries (replaces the external arr-stuck-import-handler sidecar)
+- Renames single-file symlinks to the release name so Sonarr/Radarr can parse weird inner debrid filenames (`symlink_file_naming`, default on)
 
 ## Fork Additions
 
@@ -82,8 +83,29 @@ classifies every record into one of three verdicts:
 
 Configured via the UI (Repair tab → Queue Janitor block) or env
 (`DECYPHARR_QUEUE_JANITOR__ENABLED`, `_INTERVAL`, `_GRACE_MINUTES`,
-`_COOLDOWN_HOURS`, `_MAX_PER_RUN`). Default on, 60-min grace, 24-h
-cooldown, 10/run cap.
+`_COOLDOWN_HOURS`, `_MAX_PER_RUN`). Default on, 30-min grace, 24-h
+cooldown, 25/run cap, sweeping every 5 minutes.
+
+### Symlink file naming
+
+Debrid archives often contain inner files with names that Sonarr/Radarr's
+parser can't reconcile against a known release — `00000.m2ts` for BDMV
+remuxes, truncated or foreign-language variants, missing year/quality
+tags, etc. The symlink would inherit that inner name verbatim and the
+arr would surface "Unable to parse file" / "Movie title mismatch" /
+"Manual Import required" against a download that's actually on disk.
+
+With `symlink_file_naming: release` (default), single-file releases get
+their symlink named after the indexer's release name (which uploaders
+craft to be parser-friendly) while keeping the original file extension.
+Multi-file releases (TV episode packs, BDMV folders) always keep their
+inner filenames either way — renaming per-episode files would lose
+season/episode numbers.
+
+Toggle via the UI (General Settings → Symlink File Naming) or env
+`DECYPHARR_SYMLINK_FILE_NAMING=inner` to opt out and preserve the
+upstream behaviour (useful if your debrid consistently ships better
+names than the release name itself).
 
 ### `markEntryBad` error propagation (existing fork patch)
 
