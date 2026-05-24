@@ -161,7 +161,15 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Real qBittorrent returns "Ok." as the response body on success.
+	// Sonarr parses this to confirm the add succeeded and bind the
+	// download to the client (downloadClientId on the history record).
+	// An empty body left every recent grab with downloadClientId=null,
+	// which broke Sonarr's later /api/v2/torrents/info polling for that
+	// hash — Sonarr's queue stayed at 0 even though Decypharr accepted
+	// the grab.
 	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("Ok."))
 }
 
 func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
