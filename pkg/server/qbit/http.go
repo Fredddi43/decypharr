@@ -67,19 +67,92 @@ func (q *QBit) handleShutdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (q *QBit) handleTorrentsInfo(w http.ResponseWriter, r *http.Request) {
-	//log all url params
 	ctx := r.Context()
 	category := getCategory(ctx)
-	state := strings.Trim(r.URL.Query().Get("filter"), "")
+	filter := strings.TrimSpace(r.URL.Query().Get("filter"))
 	hashes := getHashes(ctx)
 
-	// Convert hashes to filter function
-	torrents := q.manager.Queue().ListFilter(category, config.ProtocolTorrent, storage.TorrentState(state), hashes, "added_on", false)
+	// qBittorrent's `filter` query param is a *grouping* (all,
+	// downloading, completed, seeding, paused, active, inactive,
+	// resumed, stalled, stalled_uploading, stalled_downloading,
+	// errored), NOT a raw torrent state. Sonarr's QBittorrentProxyV2
+	// always sends `filter=all` and a `category=` to fetch every
+	// tracked download for an arr in one call.
+	//
+	// Previously we cast filter directly to a TorrentState and used it
+	// for an exact equality match — which meant `filter=all` matched
+	// nothing (no entry has state="all"), Sonarr's poll returned 0
+	// records, and Sonarr's TrackedDownloadStatusService never bound
+	// the grab to the download client. Translate the qBit filter to a
+	// predicate over our internal states instead.
+	torrents := q.manager.Queue().ListFilter(category, config.ProtocolTorrent, "", hashes, "added_on", false)
+	if filter != "" && filter != "all" {
+		torrents = filterByQBitState(torrents, filter)
+	}
 	qbitTorrents := make([]Torrent, len(torrents))
 	for i, t := range torrents {
 		qbitTorrents[i] = convertToQBitTorrentTorrent(t)
 	}
 	utils.JSONResponse(w, qbitTorrents, http.StatusOK)
+}
+
+// filterByQBitState narrows the list to entries matching the qBit-style
+// filter grouping. Unrecognised filter values fall through to returning
+// the input unchanged (real qBit silently ignores invalid filters).
+func filterByQBitState(entries []*storage.Entry, filter string) []*storage.Entry {
+	matches := func(*storage.Entry) bool { return true }
+	switch strings.ToLower(filter) {
+	case "downloading":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "downloading" || s == "stalledDL" || s == "queuedDL" || s == "metaDL" || s == "forcedDL" || s == "pausedDL"
+		}
+	case "seeding", "completed", "uploading":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "uploading" || s == "stalledUP" || s == "queuedUP" || s == "forcedUP" || s == "pausedUP" || s == "checkingUP"
+		}
+	case "paused":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "pausedDL" || s == "pausedUP"
+		}
+	case "active":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "downloading" || s == "uploading" || s == "metaDL" || s == "forcedDL" || s == "forcedUP"
+		}
+	case "inactive":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "pausedDL" || s == "pausedUP" || s == "stalledDL" || s == "stalledUP" || s == "queuedDL" || s == "queuedUP" || s == "error"
+		}
+	case "resumed":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s != "pausedDL" && s != "pausedUP"
+		}
+	case "stalled":
+		matches = func(e *storage.Entry) bool {
+			s := string(e.State)
+			return s == "stalledDL" || s == "stalledUP"
+		}
+	case "stalled_uploading":
+		matches = func(e *storage.Entry) bool { return string(e.State) == "stalledUP" }
+	case "stalled_downloading":
+		matches = func(e *storage.Entry) bool { return string(e.State) == "stalledDL" }
+	case "errored":
+		matches = func(e *storage.Entry) bool { return string(e.State) == "error" }
+	default:
+		return entries // unknown filter: pass through
+	}
+	out := entries[:0]
+	for _, e := range entries {
+		if matches(e) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
