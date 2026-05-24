@@ -66,6 +66,7 @@ var defaultFailedPatterns = []string{
 	"no video files",
 	"no such file or directory",
 	"could not import",
+	"found archive file",
 	"file is locked",
 	"import failed",
 	"manual import required",
