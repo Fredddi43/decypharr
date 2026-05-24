@@ -258,6 +258,37 @@ func (a *Arr) FindGrabHistoryByDownloadID(downloadID string) (int, error) {
 	return data.Records[0].ID, nil
 }
 
+// HasImportedHistory reports whether the arr has ever recorded a
+// downloadFolderImported event for the given downloadId. Used by the
+// Queue Janitor to identify pausedUP entries in Decypharr's qBit-compat
+// queue that the arr has already finished with — those are safe to
+// evict (replaces the dead upstream arr.Cleanup flag).
+func (a *Arr) HasImportedHistory(downloadID string) (bool, error) {
+	if a == nil {
+		return false, fmt.Errorf("arr not configured")
+	}
+	if strings.TrimSpace(downloadID) == "" {
+		return false, nil
+	}
+
+	query := gourl.Values{}
+	query.Add("page", "1")
+	query.Add("pageSize", "10")
+	query.Add("eventType", "3") // 3 = downloadFolderImported
+	query.Add("downloadId", strings.ToUpper(downloadID))
+
+	var data HistorySchema
+	url := "api/v3/history?" + query.Encode()
+	resp, err := a.Request(http.MethodGet, url, nil, &data)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("history lookup failed: %s", resp.Status)
+	}
+	return len(data.Records) > 0, nil
+}
+
 // MarkHistoryFailed marks a grab history record as failed. This blocklists
 // the release in the arr and, if redownload is enabled, triggers a re-search
 // for whatever is currently missing from that grab's scope.

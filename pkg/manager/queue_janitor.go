@@ -238,6 +238,94 @@ func (j *QueueJanitor) runPass(ctx context.Context) {
 	// Decypharr-side: drain state=error entries by blocklisting in the
 	// arr (so Failed Download Handling kicks in) and deleting the entry.
 	j.sweepDecypharrErrors(ctx, arrs, now, graceCutoff)
+
+	// Decypharr-side: drain pausedUP entries the arr already imported.
+	// Replaces the dead upstream arr.Cleanup flag.
+	j.sweepDecypharrImported(ctx, arrs, now)
+}
+
+// sweepDecypharrImported walks Decypharr's queue for pausedUP entries
+// whose arr has already recorded a downloadFolderImported event for the
+// hash — that means the arr is done with the entry and the qBit-compat
+// queue record is just dead weight. Drop it from Decypharr.
+//
+// The upstream `arr.Cleanup bool` flag is wired to nothing in upstream
+// code (verified: the field is set on the Arr struct but never read to
+// gate any behaviour), so without this sweep pausedUP entries pile up
+// forever even though the arr has long since finished with them. We
+// don't honour grace here: the imported event itself is the signal that
+// the arr is done, so any delay just makes the qBit list noisier.
+func (j *QueueJanitor) sweepDecypharrImported(ctx context.Context, arrs []*arr.Arr, now time.Time) {
+	_ = ctx // arr requests use their own per-call timeouts
+	paused := j.manager.queue.ListFilter("", config.ProtocolAll, storage.EntryStatePausedUP, nil, "", true)
+	if len(paused) == 0 {
+		return
+	}
+
+	arrByName := make(map[string]*arr.Arr, len(arrs))
+	for _, a := range arrs {
+		if a != nil && a.Name != "" {
+			arrByName[strings.ToLower(a.Name)] = a
+		}
+	}
+
+	acted := 0
+	maxActs := j.maxPerRun()
+	dropped := 0
+
+	for _, entry := range paused {
+		if acted >= maxActs {
+			break
+		}
+		if entry == nil {
+			continue
+		}
+		a := arrByName[strings.ToLower(entry.Category)]
+		if a == nil {
+			continue
+		}
+
+		key := "decypharr-imported:" + strings.ToLower(entry.InfoHash)
+		j.mu.Lock()
+		_, inCooldown := j.acted[key]
+		j.mu.Unlock()
+		if inCooldown {
+			continue
+		}
+
+		imported, err := a.HasImportedHistory(entry.InfoHash)
+		if err != nil {
+			j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("HasImportedHistory failed")
+			continue
+		}
+		if !imported {
+			continue
+		}
+
+		if err := j.manager.queue.Delete(entry.InfoHash, nil); err != nil && !strings.Contains(err.Error(), "not found") {
+			j.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Decypharr queue delete (imported) failed")
+			continue
+		}
+
+		j.mu.Lock()
+		j.acted[key] = now
+		j.mu.Unlock()
+		acted++
+		dropped++
+
+		j.logger.Info().
+			Str("hash", entry.InfoHash).
+			Str("category", entry.Category).
+			Str("name", truncate(entry.Name, 80)).
+			Msg("Drained Decypharr pausedUP entry (arr already imported)")
+	}
+
+	if dropped > 0 {
+		j.logger.Info().
+			Int("paused_entries", len(paused)).
+			Int("deleted_from_decypharr", dropped).
+			Msg("Decypharr imported-paused sweep complete")
+	}
 }
 
 // sweepDecypharrErrors walks Decypharr's own queue for state=error entries
