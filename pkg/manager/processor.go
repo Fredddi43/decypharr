@@ -16,52 +16,36 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
-// AddNewTorrent creates a torrent from import request and processes it
+// AddNewTorrent creates a torrent from an import request and kicks off
+// debrid submission asynchronously.
+//
+// Real qBittorrent returns 200 OK from /api/v2/torrents/add immediately
+// after accepting the magnet — the actual swarm join + verification
+// happens in the background. Sonarr/Radarr's HTTP client has a relatively
+// tight timeout (~30s) on that call; anything longer is treated as
+// "client unreachable", with no entry added on the arr side.
+//
+// Doing the full SendToDebrid round-trip synchronously (TorBox retries +
+// fallback to RealDebrid + CheckStatus polls) can easily push past that
+// window, especially when a debrid provider's API is slow or
+// rate-limited. So we:
+//
+//   1. Insert a placeholder entry into Decypharr's queue in
+//      state=downloading immediately. This is what shows up in subsequent
+//      /api/v2/torrents/info polls so the arr can match the downloadId
+//      against its grab history and start tracking.
+//   2. Return nil (handler responds 200 OK) so the arr's HTTP request
+//      completes within milliseconds, well inside its timeout.
+//   3. Run SendToDebrid + processNewTorrent in a goroutine. On success
+//      the entry transitions to pausedUP with files; on universal debrid
+//      rejection it transitions to state=error and the Queue Janitor's
+//      Decypharr-error sweep blocklists + re-searches via the arr.
 func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) error {
-	var (
-		debridTorrent *debridTypes.Torrent
-		err           error
-	)
-
-	debridTorrent, err = m.SendToDebrid(ctx, importReq)
-	if err != nil {
-		// Check if too many active downloads
-		var customErr *customerror.Error
-		if errors.As(err, &customErr) && customErr.Code == "too_many_active_downloads" {
-			m.logger.Warn().Msgf("Too many active downloads, marking as queued: %s", importReq.Magnet.Name)
-			if err := m.queue.ReQueue(importReq); err != nil {
-				return err
-			}
-			return nil
-		}
-		// All configured debrids rejected the magnet (DMCA / 451, "file
-		// not available", quota exhausted with no fallback, …). Synthesise
-		// a queue entry in state=error so the qBit-compat /torrents/info
-		// surfaces it as an errored torrent — that lets the arr's built-in
-		// Failed Download Handling blocklist this specific release and
-		// search for a different one, instead of the arr seeing a
-		// connection-error and trying the same release again later.
-		//
-		// Critically: NEVER return an error from this path. Real qBittorrent
-		// always returns 200 OK from /api/v2/torrents/add — failures surface
-		// later via /torrents/info state polling. If we return an error here
-		// the qBit-compat handler returns HTTP 400, which Sonarr/Radarr
-		// interpret as "download client misconfigured, abort entirely" and
-		// they will refuse to even queue the grab (logged as "Failed to
-		// connect to qBittorrent, please check your settings"). That means
-		// no queue entry on the arr side → nothing for Failed Download
-		// Handling or our Queue Janitor to act on. Better to log the
-		// synthesis failure and return nil so the arr at least proceeds
-		// (and will retry later or eventually surface a stalled state).
-		if rejectErr := m.recordRejectedSubmission(importReq, err); rejectErr != nil {
-			m.logger.Warn().Err(rejectErr).Str("hash", importReq.Magnet.InfoHash).Str("name", importReq.Magnet.Name).Msg("Failed to record rejected submission; returning 200 anyway so the arr keeps tracking and can retry")
-			return nil
-		}
-		m.logger.Warn().Err(err).Str("hash", importReq.Magnet.InfoHash).Str("name", importReq.Magnet.Name).Msg("All debrids rejected the magnet — queued as state=error so the arr can blocklist + re-search")
-		return nil
+	if importReq == nil || importReq.Magnet == nil || importReq.Arr == nil {
+		return fmt.Errorf("invalid import request")
 	}
 
-	// Create managed torrent with InfoHash as primary key
+	now := time.Now()
 	torrent := &storage.Entry{
 		InfoHash:         importReq.Magnet.InfoHash,
 		Name:             importReq.Magnet.Name,
@@ -76,27 +60,71 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		State:            storage.EntryStateDownloading,
 		Progress:         0,
 		Action:           importReq.Action,
-		DownloadUncached: debridTorrent.DownloadUncached,
 		CallbackURL:      importReq.CallBackUrl,
 		SkipMultiSeason:  importReq.SkipMultiSeason,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
-		AddedOn:          time.Now(),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		AddedOn:          now,
 		Providers:        make(map[string]*storage.ProviderEntry),
 		Files:            make(map[string]*storage.File),
 		Tags:             []string{},
 	}
 	torrent.ContentPath = torrent.DownloadPath()
 
-	// Add to queue
 	if err := m.queue.Add(torrent); err != nil {
 		return fmt.Errorf("failed to add torrent to queue: %w", err)
 	}
 
-	// Parse in background
-	go m.processNewTorrent(torrent, debridTorrent)
+	// Submit + process in the background so the qBit-compat /add returns
+	// fast. context.Background() because the goroutine outlives the HTTP
+	// request that triggered it.
+	go m.submitNewTorrentAsync(context.Background(), importReq, torrent)
 
 	return nil
+}
+
+// submitNewTorrentAsync runs SendToDebrid for a newly-queued entry and
+// transitions the placeholder into either a normal "downloading → pausedUP"
+// flow or a "state=error" terminal state. Always runs in its own goroutine.
+func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRequest, entry *storage.Entry) {
+	debridTorrent, err := m.SendToDebrid(ctx, importReq)
+	if err == nil {
+		// Carry over any debrid-side download_uncached decision into the
+		// placeholder entry, then hand off to the normal processor.
+		entry.DownloadUncached = debridTorrent.DownloadUncached
+		_ = m.queue.Update(entry)
+		m.processNewTorrent(entry, debridTorrent)
+		return
+	}
+
+	// "Too many active downloads" is a transient back-pressure signal —
+	// don't mark the entry as failed; reset it for re-processing on the
+	// next queued-entries sweep.
+	var customErr *customerror.Error
+	if errors.As(err, &customErr) && customErr.Code == "too_many_active_downloads" {
+		m.logger.Warn().Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("Too many active downloads — will retry on the next queued-entries sweep")
+		entry.State = storage.EntryStateDownloading
+		entry.IsDownloading = false
+		_ = m.queue.Update(entry)
+		return
+	}
+
+	// Every configured debrid rejected the magnet. Transition the
+	// placeholder into state=error so the Queue Janitor's Decypharr-error
+	// sweep picks it up, blocklists in the arr (MarkHistoryFailed), and
+	// drops the entry.
+	m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("All debrids rejected the magnet — entry transitioning to state=error so the arr can blocklist + re-search")
+	entry.MarkAsError(err)
+	entry.Status = debridTypes.TorrentStatusError
+	if entry.AddedOn.IsZero() {
+		entry.AddedOn = time.Now()
+	}
+	if entry.LastErrorTime == nil {
+		now := time.Now()
+		entry.LastErrorTime = &now
+	}
+	entry.Tags = append(entry.Tags, "submission-rejected")
+	_ = m.queue.Update(entry)
 }
 
 func (m *Manager) processQueuedEntries() {
@@ -427,46 +455,6 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 	}
 	joinedErrors := errors.Join(errs...)
 	return nil, fmt.Errorf("failed to process torrent: %w", joinedErrors)
-}
-
-// recordRejectedSubmission stores a minimal storage.Entry in state=error
-// for a magnet that every configured debrid refused to accept. The qBit-
-// compat /torrents/info will then expose it to the arr as a failed
-// download, triggering the arr's Failed Download Handling — which
-// blocklists the release and kicks off a fresh search for a different
-// one. Without this the arr just sees the qBit-compat /torrents/add
-// return an error and treats the whole thing as a transient client
-// problem (i.e. happily re-grabs the same release on the next sweep).
-func (m *Manager) recordRejectedSubmission(importReq *ImportRequest, submitErr error) error {
-	if importReq == nil || importReq.Magnet == nil || importReq.Arr == nil {
-		return fmt.Errorf("invalid import request for rejected-submission record")
-	}
-	now := time.Now()
-	entry := &storage.Entry{
-		InfoHash:         importReq.Magnet.InfoHash,
-		Name:             importReq.Magnet.Name,
-		OriginalFilename: importReq.Magnet.Name,
-		Protocol:         config.ProtocolTorrent,
-		Size:             importReq.Magnet.Size,
-		Bytes:            importReq.Magnet.Size,
-		Magnet:           importReq.Magnet.Link,
-		Category:         importReq.Arr.Name,
-		SavePath:         filepath.Join(importReq.DownloadFolder, importReq.Arr.Name),
-		Status:           debridTypes.TorrentStatusError,
-		Action:           importReq.Action,
-		DownloadUncached: false,
-		CallbackURL:      importReq.CallBackUrl,
-		SkipMultiSeason:  importReq.SkipMultiSeason,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		AddedOn:          now,
-		Providers:        make(map[string]*storage.ProviderEntry),
-		Files:            make(map[string]*storage.File),
-		Tags:             []string{"submission-rejected"},
-	}
-	entry.MarkAsError(submitErr) // sets State=EntryStateError, LastError, etc.
-	entry.ContentPath = entry.DownloadPath()
-	return m.queue.Add(entry)
 }
 
 // orderDebridClientsBySelection returns clients with the named one (if any)
