@@ -83,10 +83,14 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 	//     set, so TorBox's own 429 also fails fast.
 	// Either condition lets SendToDebrid move to the next debrid in ~1s
 	// without holding open Radarr/Sonarr's qBit-compat /torrents/add call.
+	// MaxRetries=1 and no retryable statuses: submission should fail fast.
+	// Any non-2xx (429, 451, 502, ...) bubbles up immediately so the
+	// SendToDebrid loop can try the next debrid within ~100ms instead of
+	// burning ~20s on retryablehttp's exponential backoff against a
+	// guaranteed-failing endpoint.
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
-		request.WithMaxRetries(cfg.Retries),
-		request.WithRetryableStatus(http.StatusBadGateway),
+		request.WithMaxRetries(1),
 	}
 	if submitAllow != nil {
 		submitOpts = append(submitOpts, request.WithNonBlockingRateLimit(submitAllow))

@@ -85,12 +85,12 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 	}
 
 	// Submit client: fast-fail path for /torrents/addMagnet & addTorrent.
-	// Non-blocking rate limiter (Allow → ErrRateLimitExhausted) + 429
-	// dropped from the retryable set, so a saturated bucket OR an upstream
-	// 429 both surface in ~1s and SendToDebrid can try the next debrid.
+	// MaxRetries=1 and no retryable statuses — any non-2xx (429, 451 for
+	// DMCA'd hashes, 5xx) bubbles up immediately so the SendToDebrid loop
+	// can try the next configured debrid within ~100ms.
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
-		request.WithMaxRetries(cfg.Retries),
+		request.WithMaxRetries(1),
 		request.WithProxy(dc.Proxy),
 	}
 	if submitAllow != nil {

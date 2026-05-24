@@ -59,10 +59,11 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		opts = append(opts, request.WithProxy(dc.Proxy))
 	}
 
+	// MaxRetries=1 and no retryable statuses — any non-2xx bubbles up so
+	// SendToDebrid can fall over to the next debrid in ~100ms.
 	submitOpts := []request.ClientOption{
 		request.WithHeaders(headers),
-		request.WithMaxRetries(cfg.Retries),
-		request.WithRetryableStatus(http.StatusBadGateway), // no 429 retry on submit
+		request.WithMaxRetries(1),
 	}
 	if submitAllow != nil {
 		submitOpts = append(submitOpts, request.WithNonBlockingRateLimit(submitAllow))

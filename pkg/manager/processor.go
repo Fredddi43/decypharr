@@ -364,7 +364,17 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 
 		dbt, err := db.SubmitMagnet(debridTorrent)
 		if err != nil || dbt == nil || dbt.Id == "" {
-			errs = append(errs, err)
+			// Surface the actual reason this provider rejected the magnet
+			// so failures don't look like silent stalls. When the next
+			// debrid succeeds this just becomes a debug breadcrumb; when
+			// they all fail it tells the operator (and the arrs' "Failed
+			// Download" logic) what actually went wrong.
+			reason := err
+			if reason == nil {
+				reason = fmt.Errorf("no torrent id returned")
+			}
+			_logger.Warn().Err(reason).Str("Provider", db.Config().Name).Str("Hash", debridTorrent.InfoHash).Msg("SubmitMagnet failed; trying next debrid")
+			errs = append(errs, fmt.Errorf("%s: %w", db.Config().Name, reason))
 			continue
 		}
 		dbt.Arr = importRequest.Arr
@@ -378,11 +388,12 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			}(torrent.Id)
 		}
 		if err != nil {
-			errs = append(errs, err)
+			_logger.Warn().Err(err).Str("Provider", db.Config().Name).Msg("CheckStatus failed; trying next debrid")
+			errs = append(errs, fmt.Errorf("%s: %w", db.Config().Name, err))
 			continue
 		}
 		if torrent == nil {
-			errs = append(errs, fmt.Errorf("torrent %s returned nil after checking status", dbt.Name))
+			errs = append(errs, fmt.Errorf("%s: torrent %s returned nil after checking status", db.Config().Name, dbt.Name))
 			continue
 		}
 		return torrent, nil
