@@ -232,12 +232,26 @@ func hashesContext(next http.Handler) http.Handler {
 			hashes = strings.Split(_hashes, "|")
 		}
 		if hashes == nil {
-			// GetReader hashes from form
+			// Fall back to query / form-data. qBittorrent's API uses a
+			// single `hashes` param with values pipe-separated
+			// (`?hashes=A|B|C`); r.Form returns the whole string as one
+			// entry, so we have to split each value here too. Without
+			// this Sonarr's batch-poll (which sends pipe-separated
+			// downloadIds for all tracked torrents in one request)
+			// hit zero matches and Sonarr concluded the torrents were
+			// gone.
 			_ = r.ParseForm()
-			hashes = r.Form["hashes"]
-		}
-		for i, hash := range hashes {
-			hashes[i] = strings.TrimSpace(hash)
+			for _, raw := range r.Form["hashes"] {
+				for _, h := range strings.Split(raw, "|") {
+					if h = strings.TrimSpace(h); h != "" {
+						hashes = append(hashes, h)
+					}
+				}
+			}
+		} else {
+			for i, hash := range hashes {
+				hashes[i] = strings.TrimSpace(hash)
+			}
 		}
 		ctx := context.WithValue(r.Context(), hashesKey, hashes)
 		next.ServeHTTP(w, r.WithContext(ctx))
