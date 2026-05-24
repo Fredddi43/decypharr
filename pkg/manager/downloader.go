@@ -247,7 +247,18 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(entry *storage.Entry, fi
 			mediaFileCount++
 		}
 	}
-	releaseBase := strings.TrimSpace(utils.RemoveExtension(entry.Name))
+	// entry.Name is unreliable across debrid providers — some return the
+	// infohash here. entry.OriginalFilename is the upload's filename and is
+	// what storage.GetTorrentFolder uses for the "original" folder-naming
+	// modes. Prefer it; fall back to the symlink directory's basename
+	// (which is whatever the configured FolderNaming produced).
+	releaseBase := strings.TrimSpace(utils.RemoveExtension(entry.OriginalFilename))
+	if releaseBase == "" {
+		releaseBase = strings.TrimSpace(utils.RemoveExtension(filepath.Base(symlinkDir)))
+	}
+	if isInfohashLike(releaseBase) {
+		releaseBase = "" // skip rename — we have no parser-friendly name to use
+	}
 
 	filePaths := make([]string, 0, len(remainingFiles))
 	deadline := time.Now().Add(symlinkMountWaitTimeout)
@@ -489,6 +500,24 @@ func limitedStringSample(values []string, limit int) []string {
 	sample := append([]string(nil), values[:limit]...)
 	sample = append(sample, fmt.Sprintf("... %d more", len(values)-limit))
 	return sample
+}
+
+// isInfohashLike reports whether s looks like a torrent infohash: a 40-char
+// (SHA-1, hex) or 32-char (BTIH, base32) all-alphanumeric string with no
+// dots/spaces. Some debrid providers return the infohash as Entry.Name, which
+// makes for an awful symlink filename — skip the rename in that case.
+func isInfohashLike(s string) bool {
+	if len(s) != 32 && len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // processDownload downloads all files for an entry with progress tracking
