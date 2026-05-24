@@ -400,6 +400,21 @@ type TorrentFile struct {
 
 // ToQBitTorrent converts to QBitTorrent format for API compatibility
 func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
+	// Sonarr/Radarr use completion_on to decide when a torrent is finished
+	// and ready for import-scan; a value of 0 means "not yet complete" and
+	// the arr will keep polling without ever triggering import. Real
+	// qBittorrent sets this to the unix epoch when the torrent hit 100%.
+	// Mirror that: use Entry.CompletedAt when set, fall back to CreatedAt
+	// for entries that are 100% / in an upload state but predate the
+	// CompletedAt field being populated. Only zero this when the entry is
+	// genuinely not done yet.
+	var completionOn int64
+	if t.CompletedAt != nil && !t.CompletedAt.IsZero() {
+		completionOn = t.CompletedAt.Unix()
+	} else if t.Progress >= 1 || isCompletedState(t.State) {
+		completionOn = t.CreatedAt.Unix()
+	}
+
 	qbitTorrent := Torrent{
 		Hash:         t.InfoHash,
 		Name:         t.Name,
@@ -413,7 +428,7 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 		SavePath:     t.SavePath,
 		ContentPath:  t.ContentPath,
 		AddedOn:      t.CreatedAt.Unix(),
-		CompletionOn: 0,
+		CompletionOn: completionOn,
 		Debrid:       t.ActiveProvider,
 		DebridID:     "",
 		AmountLeft:   int64(float64(t.Size) * (1 - t.Progress)),
@@ -430,6 +445,19 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 	}
 
 	return qbitTorrent
+}
+
+// isCompletedState reports whether the qBit-compat state string represents a
+// finished torrent — i.e. one whose completion_on timestamp should be set.
+// Sonarr/Radarr look at completion_on to schedule their completed-download
+// import scan, so being conservative here matches the upstream qBittorrent
+// behaviour: any seeding/paused-uploading state counts as "done".
+func isCompletedState(state storage.TorrentState) bool {
+	switch string(state) {
+	case "uploading", "stalledUP", "queuedUP", "forcedUP", "pausedUP", "checkingUP":
+		return true
+	}
+	return false
 }
 
 func getTorrentFiles(t *storage.Entry) []TorrentFile {
