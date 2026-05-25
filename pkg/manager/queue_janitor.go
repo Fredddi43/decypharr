@@ -394,6 +394,20 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 			continue
 		}
 
+		// Transient errors should NOT trigger arr-side blocklisting.
+		// Rate-limit exhaustion + transport timeouts mean the release
+		// might be perfectly fine and re-submit will succeed once the
+		// quota resets / network blips clear. Blocklisting them
+		// permanently bans the release name from future grabs, which is
+		// way too aggressive for transient failures. Leave the entry in
+		// state=error and skip — next time the entry is re-submitted
+		// (by AddNewTorrent, the repair sweep, or manual user action)
+		// it'll cycle back through SendToDebrid cleanly.
+		if isTransientErrorReason(entry.LastError) {
+			j.logger.Debug().Str("hash", entry.InfoHash).Str("reason", truncate(entry.LastError, 80)).Msg("Skipping Decypharr error entry — transient failure, will be retried")
+			continue
+		}
+
 		key := "decypharr:" + strings.ToLower(entry.InfoHash)
 		j.mu.Lock()
 		_, inCooldown := j.acted[key]
@@ -668,6 +682,47 @@ func pickRecordTime(rec arrQueueRecord) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// isTransientErrorReason reports whether the recorded LastError on a
+// Decypharr entry looks like a recoverable failure (rate limit, network
+// timeout, 5xx from the debrid) versus a permanent one (DMCA 451,
+// "not cached", "not available", auth failures). Transient errors
+// should NOT trigger the arr-side blocklist+research path — re-submit
+// will succeed once quotas reset, so blocklisting a perfectly good
+// release just because the user happened to be over quota would
+// permanently ban its name from future grabs.
+//
+// Matched case-insensitively against the joined error message. The
+// patterns are intentionally narrow — anything we don't explicitly
+// recognise as transient gets treated as permanent (current
+// blocklist+research behaviour).
+func isTransientErrorReason(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	r := strings.ToLower(reason)
+	transients := []string{
+		"rate limit",
+		"too many requests",
+		"giving up after", // retryablehttp client gave up after N attempts
+		"timeout",
+		"deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"network is unreachable",
+		"no such host",
+		"i/o timeout",
+		"eof",                  // server hung up
+		"status: 429",          // explicit rate limit
+		"status: 500", "status: 502", "status: 503", "status: 504",
+	}
+	for _, t := range transients {
+		if strings.Contains(r, t) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {
