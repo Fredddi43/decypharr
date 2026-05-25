@@ -368,19 +368,12 @@ func (j *QueueJanitor) sweepDecypharrImported(ctx context.Context, arrs []*arr.A
 // honour cooldown (don't hammer the same hash) and max-per-run.
 func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr, now, graceCutoff time.Time) {
 	_ = graceCutoff // intentionally unused: error entries don't need to settle
+	_ = arrs        // arr lookup happens inside dropPermanentlyRejected via the shared manager handle
 	errored := j.manager.queue.ListFilter("", config.ProtocolAll, storage.EntryStateError, nil, "", true)
 	if len(errored) == 0 {
 		return
 	}
 	j.logger.Debug().Int("error_entries", len(errored)).Msg("Decypharr error sweep starting")
-
-	// Build a quick name → arr map so we can route entries by category.
-	arrByName := make(map[string]*arr.Arr, len(arrs))
-	for _, a := range arrs {
-		if a != nil && a.Name != "" {
-			arrByName[strings.ToLower(a.Name)] = a
-		}
-	}
 
 	acted := 0
 	maxActs := j.maxPerRun()
@@ -408,40 +401,15 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 			continue
 		}
 
-		key := "decypharr:" + strings.ToLower(entry.InfoHash)
-		j.mu.Lock()
-		_, inCooldown := j.acted[key]
-		j.mu.Unlock()
-		if inCooldown {
+		bl, dr := j.dropPermanentlyRejected(entry)
+		if !dr {
+			// Either in cooldown or the queue.Delete failed (already logged).
 			continue
 		}
-
-		a := arrByName[strings.ToLower(entry.Category)]
-		if a != nil {
-			histID, err := a.FindGrabHistoryByDownloadID(entry.InfoHash)
-			if err != nil {
-				j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("history lookup failed")
-			} else if histID > 0 {
-				if err := a.MarkHistoryFailed(histID); err != nil {
-					j.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", histID).Str("hash", entry.InfoHash).Msg("MarkHistoryFailed failed; deleting Decypharr entry anyway")
-				} else {
-					blocklisted++
-				}
-			}
-		}
-
-		// Delete from Decypharr regardless of arr outcome. An error entry
-		// has no debrid placement and no symlinks to clean, so this is a
-		// pure metadata drop.
-		if err := j.manager.queue.Delete(entry.InfoHash, nil); err != nil && !strings.Contains(err.Error(), "not found") {
-			j.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Decypharr queue delete failed")
-			continue
+		if bl {
+			blocklisted++
 		}
 		dropped++
-
-		j.mu.Lock()
-		j.acted[key] = now
-		j.mu.Unlock()
 		acted++
 
 		j.logger.Info().
@@ -460,6 +428,74 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 			Int("deleted_from_decypharr", dropped).
 			Msg("Decypharr error sweep complete")
 	}
+}
+
+// dropPermanentlyRejected drains an entry whose all-debrids-rejected
+// outcome is known to be permanent: it asks the matching arr to
+// MarkHistoryFailed (blocklist + re-search) and deletes the entry from
+// Decypharr's queue. The per-hash cooldown is honoured and only
+// extended on a successful drop, so a queue.Delete failure can be
+// retried by the next sweep pass.
+//
+// Returns blocklisted=true if MarkHistoryFailed succeeded, dropped=true
+// if the queue.Delete succeeded. Callers should not log when dropped is
+// false (cooldown or already-logged error).
+//
+// Safe to call from both the periodic janitor sweep and from
+// submitNewTorrentAsync's eager path.
+func (j *QueueJanitor) dropPermanentlyRejected(entry *storage.Entry) (blocklisted bool, dropped bool) {
+	if entry == nil {
+		return
+	}
+	key := "decypharr:" + strings.ToLower(entry.InfoHash)
+	j.mu.Lock()
+	_, inCooldown := j.acted[key]
+	j.mu.Unlock()
+	if inCooldown {
+		return
+	}
+
+	if a := j.lookupArr(entry.Category); a != nil {
+		histID, err := a.FindGrabHistoryByDownloadID(entry.InfoHash)
+		if err != nil {
+			j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("history lookup failed")
+		} else if histID > 0 {
+			if err := a.MarkHistoryFailed(histID); err != nil {
+				j.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", histID).Str("hash", entry.InfoHash).Msg("MarkHistoryFailed failed; deleting Decypharr entry anyway")
+			} else {
+				blocklisted = true
+			}
+		}
+	}
+
+	// Delete from Decypharr regardless of arr outcome. An error entry
+	// has no debrid placement and no symlinks to clean, so this is a
+	// pure metadata drop.
+	if err := j.manager.queue.Delete(entry.InfoHash, nil); err != nil && !strings.Contains(err.Error(), "not found") {
+		j.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Decypharr queue delete failed")
+		return
+	}
+	dropped = true
+
+	j.mu.Lock()
+	j.acted[key] = time.Now()
+	j.mu.Unlock()
+	return
+}
+
+// lookupArr returns the configured *arr.Arr whose Name matches category
+// case-insensitively, or nil if no arr is configured for that category.
+func (j *QueueJanitor) lookupArr(category string) *arr.Arr {
+	if category == "" || j.manager == nil || j.manager.arr == nil {
+		return nil
+	}
+	want := strings.ToLower(category)
+	for _, a := range j.manager.arr.GetAll() {
+		if a != nil && strings.ToLower(a.Name) == want {
+			return a
+		}
+	}
+	return nil
 }
 
 // expireCooldowns drops cooldown entries older than the configured window.
@@ -697,11 +733,32 @@ func pickRecordTime(rec arrQueueRecord) time.Time {
 // patterns are intentionally narrow — anything we don't explicitly
 // recognise as transient gets treated as permanent (current
 // blocklist+research behaviour).
+// isTransientErrorReason returns true only when every meaningful line of
+// reason matches a known-transient pattern. Multi-provider errors arrive
+// concatenated like
+//   "failed to process torrent: RealDebrid: ... Status: 451\nTorBox: rate limit exhausted"
+// and a single permanent line (Status: 451) must poison the whole result
+// — otherwise a permanently-DMCAed release looks transient just because
+// one of the fallback providers happened to be rate-limited.
 func isTransientErrorReason(reason string) bool {
 	if reason == "" {
 		return false
 	}
-	r := strings.ToLower(reason)
+	anyMeaningful := false
+	for _, ln := range strings.Split(reason, "\n") {
+		ln = strings.TrimSpace(strings.ToLower(ln))
+		if ln == "" {
+			continue
+		}
+		anyMeaningful = true
+		if !lineIsTransient(ln) {
+			return false
+		}
+	}
+	return anyMeaningful
+}
+
+func lineIsTransient(line string) bool {
 	transients := []string{
 		"rate limit",
 		"too many requests",
@@ -713,12 +770,12 @@ func isTransientErrorReason(reason string) bool {
 		"network is unreachable",
 		"no such host",
 		"i/o timeout",
-		"eof",                  // server hung up
-		"status: 429",          // explicit rate limit
+		"eof", // server hung up
+		"status: 429",
 		"status: 500", "status: 502", "status: 503", "status: 504",
 	}
 	for _, t := range transients {
-		if strings.Contains(r, t) {
+		if strings.Contains(line, t) {
 			return true
 		}
 	}

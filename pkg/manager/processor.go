@@ -110,9 +110,11 @@ func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRe
 	}
 
 	// Every configured debrid rejected the magnet. Transition the
-	// placeholder into state=error so the Queue Janitor's Decypharr-error
-	// sweep picks it up, blocklists in the arr (MarkHistoryFailed), and
-	// drops the entry.
+	// placeholder into state=error first so the queue accurately reflects
+	// what happened — the eager-drop path below will remove it for
+	// permanent failures; transient failures stay in state=error and
+	// wait for the janitor's next sweep (which may decide to retry
+	// later) so a transient rate-limit doesn't get a release blocklisted.
 	m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("All debrids rejected the magnet — entry transitioning to state=error so the arr can blocklist + re-search")
 	entry.MarkAsError(err)
 	entry.Status = debridTypes.TorrentStatusError
@@ -125,6 +127,25 @@ func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRe
 	}
 	entry.Tags = append(entry.Tags, "submission-rejected")
 	_ = m.queue.Update(entry)
+
+	// If this rejection is permanent (e.g. RealDebrid DMCA 451 on the
+	// only available copy), don't wait for the next janitor cycle —
+	// blocklist in the arr + remove the entry now so the search throttle
+	// stops re-picking the same dead release. The qBit-protocol
+	// "RemovedFromDownloadClient" semantics on the arr side give us the
+	// same blocklist+re-search Sonarr would normally apply on Failed,
+	// without us having to lie about the qBit state.
+	if m.queueJanitor != nil && !isTransientErrorReason(err.Error()) {
+		bl, dr := m.queueJanitor.dropPermanentlyRejected(entry)
+		if dr {
+			m.logger.Info().
+				Str("hash", entry.InfoHash).
+				Str("category", entry.Category).
+				Str("name", truncate(entry.Name, 80)).
+				Bool("blocklisted_in_arr", bl).
+				Msg("Eagerly dropped permanently-rejected Decypharr entry")
+		}
+	}
 }
 
 func (m *Manager) processQueuedEntries() {
