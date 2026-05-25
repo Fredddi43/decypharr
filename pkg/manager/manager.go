@@ -55,6 +55,14 @@ type Manager struct {
 	refreshSG   singleflight.Group
 	linkService *link.Service
 
+	// syncMissCounters tracks how many consecutive sync passes saw an
+	// entry's placement-on-provider missing from the debrid's GetTorrents
+	// response. Used to gate destructive storage.Delete on partial
+	// responses (rate-limited / paginated-with-error). Key is
+	// "<provider>:<lowercase-infohash>"; value is the consecutive miss
+	// count. Entries reset to 0 the first sync pass they're seen again.
+	syncMissCounters *xsync.Map[string, int]
+
 	// repair
 	fixer *Fixer
 	ctx   context.Context
@@ -156,6 +164,7 @@ func New() *Manager {
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
+		syncMissCounters:       xsync.NewMap[string, int](),
 	}
 
 	instance.init()

@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,14 @@ const (
 	refreshDeleteWorkers   = 10
 	refreshWorkChanBuffer  = 100
 	refreshBatchChanBuffer = 50
+	// syncMissThreshold: how many CONSECUTIVE sync passes must report a
+	// storage entry's placement as "missing from the debrid remote"
+	// before we trust the absence and remove the placement. At the
+	// default 10-min refresh interval this gives ~30 minutes of grace
+	// — long enough to ride out a single rate-limited or paginated-
+	// with-error response, short enough that real deletions still
+	// drain within an hour.
+	syncMissThreshold = 3
 )
 
 // refreshTorrents refreshes torrents from a specific debrid service.
@@ -144,6 +153,22 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 
 			if placementOnDebrid {
 				if !onRemote {
+					// Don't immediately remove the placement on the
+					// first miss. Rate-limited or paginated-with-error
+					// GetTorrents responses are incomplete, and treating
+					// them as authoritative caused mass false-deletes
+					// that broke library symlinks across the stack.
+					// Require N consecutive misses (~30 min worth of
+					// sync ticks) before we trust the absence.
+					missKey := provider + ":" + strings.ToLower(entry.InfoHash)
+					misses, _ := m.syncMissCounters.Load(missKey)
+					misses++
+					m.syncMissCounters.Store(missKey, misses)
+					if misses < syncMissThreshold {
+						// Keep the entry; we'll re-check next pass.
+						continue
+					}
+					m.syncMissCounters.Delete(missKey)
 					entry.RemoveProvider(provider, nil)
 					if len(entry.Providers) == 0 {
 						torrentsToDelete = append(torrentsToDelete, entry.InfoHash)
@@ -156,6 +181,11 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 					// So we need to fetch the full torrent info from debrid to ensure we have all the metadata to update the placement correctly
 					// So let's just add it to the newTorrents list and let processNewTorrents handle the update logic - it will be smart enough to only update the placement info without overwriting other metadata
 					newTorrents = append(newTorrents, currentTorrent)
+					m.syncMissCounters.Delete(provider + ":" + strings.ToLower(entry.InfoHash))
+				} else {
+					// Seen on remote and no update needed — reset any
+					// accumulated miss count.
+					m.syncMissCounters.Delete(provider + ":" + strings.ToLower(entry.InfoHash))
 				}
 			} else if onRemote {
 				newTorrents = append(newTorrents, currentTorrent)
