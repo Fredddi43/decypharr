@@ -308,12 +308,22 @@ func (j *QueueJanitor) sweepDecypharrImported(ctx context.Context, arrs []*arr.A
 			continue
 		}
 
-		imported, err := a.HasImportedHistory(entry.InfoHash)
+		// Hide only when BOTH conditions hold:
+		//   (1) the arr has at least one downloadFolderImported event
+		//       for this hash (it was imported at some point), AND
+		//   (2) the arr still currently has the file on disk (hasFile
+		//       on the movie/episode is true).
+		// Without (2) a delete-then-regrab cycle keeps the entry
+		// permanently hidden because the OLD import event lingers in
+		// history forever. With (2), if the arr lost the file (manual
+		// delete, broken symlink, whatever) we leave the entry visible
+		// so the arr can re-discover it on the next poll.
+		hasFile, err := a.HasCurrentFileForDownloadID(entry.InfoHash)
 		if err != nil {
-			j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("HasImportedHistory failed")
+			j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("HasCurrentFileForDownloadID failed")
 			continue
 		}
-		if !imported {
+		if !hasFile {
 			continue
 		}
 

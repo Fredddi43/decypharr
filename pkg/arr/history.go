@@ -259,10 +259,16 @@ func (a *Arr) FindGrabHistoryByDownloadID(downloadID string) (int, error) {
 }
 
 // HasImportedHistory reports whether the arr has ever recorded a
-// downloadFolderImported event for the given downloadId. Used by the
-// Queue Janitor to identify pausedUP entries in Decypharr's qBit-compat
-// queue that the arr has already finished with — those are safe to
-// evict (replaces the dead upstream arr.Cleanup flag).
+// downloadFolderImported event for the given downloadId.
+//
+// CAUTION: this is a "has the arr EVER imported this" check, not "does
+// the arr CURRENTLY have the file". A movie/episode that was imported
+// then later deleted (manual delete, broken symlink, etc.) and then
+// re-grabbed will still return true here, because the original import
+// event lives in history forever. Callers that need the
+// currently-present check should also verify the corresponding
+// movie.hasFile / episode.hasFile field via the arr API. The Queue
+// Janitor's imported-paused sweep does both checks before hiding.
 func (a *Arr) HasImportedHistory(downloadID string) (bool, error) {
 	if a == nil {
 		return false, fmt.Errorf("arr not configured")
@@ -287,6 +293,89 @@ func (a *Arr) HasImportedHistory(downloadID string) (bool, error) {
 		return false, fmt.Errorf("history lookup failed: %s", resp.Status)
 	}
 	return len(data.Records) > 0, nil
+}
+
+// HasCurrentFileForDownloadID checks whether the arr currently has the
+// imported file on disk for the given downloadId. Resolves
+// downloadId -> {movie,episode}Id via the most recent import event,
+// then queries the arr's API to read hasFile on that record.
+//
+// Used together with HasImportedHistory by the Queue Janitor: an entry
+// is only safe to hide when BOTH are true (arr imported it AND arr
+// still has the file). If the arr no longer has the file — manual
+// delete, broken symlink, anything — the user (or the arr's redownload
+// logic) wants a fresh grab to be visible.
+//
+// Returns (true, nil) only when an import record exists AND the
+// resolved media item reports hasFile=true. Any uncertainty (no
+// history, can't resolve, lookup error) returns (false, err) so the
+// caller errs on the side of "keep the entry visible".
+func (a *Arr) HasCurrentFileForDownloadID(downloadID string) (bool, error) {
+	if a == nil {
+		return false, fmt.Errorf("arr not configured")
+	}
+	if strings.TrimSpace(downloadID) == "" {
+		return false, nil
+	}
+
+	// Fetch the most recent import event to find the media id.
+	query := gourl.Values{}
+	query.Add("page", "1")
+	query.Add("pageSize", "1")
+	query.Add("eventType", "3") // downloadFolderImported
+	query.Add("sortKey", "date")
+	query.Add("sortDirection", "descending")
+	query.Add("downloadId", strings.ToUpper(downloadID))
+
+	var data HistorySchema
+	resp, err := a.Request(http.MethodGet, "api/v3/history?"+query.Encode(), nil, &data)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("history lookup failed: %s", resp.Status)
+	}
+	if len(data.Records) == 0 {
+		return false, nil
+	}
+	rec := data.Records[0]
+
+	// Sonarr stores the media id as episodeId; Radarr as movieId. The
+	// shared HistorySchema record carries both fields.
+	switch a.Type {
+	case Sonarr:
+		if rec.EpisodeID <= 0 {
+			return false, nil
+		}
+		var ep struct {
+			HasFile bool `json:"hasFile"`
+		}
+		r, err := a.Request(http.MethodGet, fmt.Sprintf("api/v3/episode/%d", rec.EpisodeID), nil, &ep)
+		if err != nil {
+			return false, err
+		}
+		if r.StatusCode != http.StatusOK {
+			return false, fmt.Errorf("episode lookup failed: %s", r.Status)
+		}
+		return ep.HasFile, nil
+	case Radarr:
+		if rec.MovieID <= 0 {
+			return false, nil
+		}
+		var movie struct {
+			HasFile bool `json:"hasFile"`
+		}
+		r, err := a.Request(http.MethodGet, fmt.Sprintf("api/v3/movie/%d", rec.MovieID), nil, &movie)
+		if err != nil {
+			return false, err
+		}
+		if r.StatusCode != http.StatusOK {
+			return false, fmt.Errorf("movie lookup failed: %s", r.Status)
+		}
+		return movie.HasFile, nil
+	default:
+		return false, nil
+	}
 }
 
 // MarkHistoryFailed marks a grab history record as failed. This blocklists
