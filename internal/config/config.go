@@ -227,12 +227,32 @@ type QueueJanitorConfig struct {
 	MaxPerRun           int      `json:"max_per_run,omitempty"`           // default 10
 	FailedPatterns      []string `json:"failed_patterns,omitempty"`       // override built-in defaults
 	AlreadyHavePatterns []string `json:"already_have_patterns,omitempty"` // override built-in defaults
+
+	// TorboxSweep deletes torrents that have been stuck in TorBox's
+	// `downloading` state past the grace window. With download_uncached
+	// disabled none should normally exist; when they do (arr-side grab paths
+	// that never actually got ingested) they block TorBox active-download
+	// slots forever. Only the torrents endpoint is touched — WebDL entries
+	// (e.g. the private-tracker archival pipeline) are physically out of
+	// reach because they live in a separate TorBox listing.
+	TorboxSweep QueueJanitorTorboxSweepConfig `json:"torbox_sweep,omitzero"`
+}
+
+type QueueJanitorTorboxSweepConfig struct {
+	Enabled      bool `json:"enabled,omitempty"`       // default false
+	GraceMinutes int  `json:"grace_minutes,omitempty"` // 0 = use parent GraceMinutes
+	MaxPerRun    int  `json:"max_per_run,omitempty"`   // 0 = use parent MaxPerRun
+}
+
+func (q QueueJanitorTorboxSweepConfig) IsZero() bool {
+	return !q.Enabled && q.GraceMinutes == 0 && q.MaxPerRun == 0
 }
 
 func (q QueueJanitorConfig) IsZero() bool {
 	return !q.Enabled && q.Interval == "" && q.GraceMinutes == 0 &&
 		q.CooldownHours == 0 && q.MaxPerRun == 0 &&
-		len(q.FailedPatterns) == 0 && len(q.AlreadyHavePatterns) == 0
+		len(q.FailedPatterns) == 0 && len(q.AlreadyHavePatterns) == 0 &&
+		q.TorboxSweep.IsZero()
 }
 
 func (c *Config) JsonFile() string {

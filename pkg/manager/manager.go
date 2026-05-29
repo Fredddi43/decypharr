@@ -539,6 +539,12 @@ func (m *Manager) StartTime() time.Time {
 	return m.startTime
 }
 
+// QueueJanitor returns the background queue janitor, used by HTTP routes
+// that expose manual-trigger endpoints (e.g. /api/janitor/torbox-sweep).
+func (m *Manager) QueueJanitor() *QueueJanitor {
+	return m.queueJanitor
+}
+
 // CRUD operations
 
 func (m *Manager) GetEntryItem(torrentName string) (*storage.EntryItem, error) {

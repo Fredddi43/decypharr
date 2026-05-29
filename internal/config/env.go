@@ -169,4 +169,17 @@ func (c *Config) applyQueueJanitorEnvVars() {
 			c.QueueJanitor.MaxPerRun = n
 		}
 	}
+	if v := getEnv("QUEUE_JANITOR__TORBOX_SWEEP__ENABLED"); v != "" {
+		c.QueueJanitor.TorboxSweep.Enabled = parseBool(v)
+	}
+	if v := getEnv("QUEUE_JANITOR__TORBOX_SWEEP__GRACE_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.TorboxSweep.GraceMinutes = n
+		}
+	}
+	if v := getEnv("QUEUE_JANITOR__TORBOX_SWEEP__MAX_PER_RUN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.TorboxSweep.MaxPerRun = n
+		}
+	}
 }

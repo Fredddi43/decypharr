@@ -52,6 +52,8 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/arr"
+	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
+	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -246,6 +248,121 @@ func (j *QueueJanitor) runPass(ctx context.Context) {
 	// Decypharr-side: drain pausedUP entries the arr already imported.
 	// Replaces the dead upstream arr.Cleanup flag.
 	j.sweepDecypharrImported(ctx, arrs, now)
+
+	// TorBox-side: drain torrents stuck in `downloading` state. None should
+	// exist with download_uncached disabled, but arr-side races occasionally
+	// leave entries hogging the 3-slot active-download cap forever.
+	j.sweepTorboxActiveDownloads(now)
+}
+
+// torboxSweepGrace returns the grace window for the TorBox sweep, falling
+// back to the parent grace setting when no override is configured.
+func (j *QueueJanitor) torboxSweepGrace() time.Duration {
+	if m := j.cfg().TorboxSweep.GraceMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return j.grace()
+}
+
+// torboxSweepMaxPerRun returns the per-pass cap for the TorBox sweep, falling
+// back to the parent cap when no override is configured.
+func (j *QueueJanitor) torboxSweepMaxPerRun() int {
+	if n := j.cfg().TorboxSweep.MaxPerRun; n > 0 {
+		return n
+	}
+	return j.maxPerRun()
+}
+
+// sweepTorboxActiveDownloads queries every configured TorBox provider for
+// torrents stuck in `downloading` state past the grace window and deletes
+// them. WebDL entries (the private-tracker archive pipeline) live in a
+// separate TorBox listing and are NOT touched.
+//
+// Safe to call concurrently from the periodic loop and from the manual
+// HTTP trigger: cooldown + max-per-run are honoured, and TorBox's
+// controltorrent endpoint is idempotent.
+func (j *QueueJanitor) sweepTorboxActiveDownloads(now time.Time) {
+	if !j.cfg().TorboxSweep.Enabled {
+		return
+	}
+
+	graceCutoff := now.Add(-j.torboxSweepGrace())
+	maxActs := j.torboxSweepMaxPerRun()
+
+	clients := j.manager.FilterDebrid(func(c debrid.Client) bool {
+		return c.Config().Provider == "torbox"
+	})
+	if len(clients) == 0 {
+		return
+	}
+
+	acted, deleted := 0, 0
+	scanned := 0
+	for _, client := range clients {
+		if acted >= maxActs {
+			break
+		}
+		torrents, err := client.GetTorrents()
+		if err != nil {
+			j.logger.Warn().Err(err).Str("debrid", client.Config().Name).Msg("TorBox sweep: GetTorrents failed")
+			continue
+		}
+		scanned += len(torrents)
+		for _, t := range torrents {
+			if acted >= maxActs {
+				break
+			}
+			if t == nil {
+				continue
+			}
+			if t.Status != types.TorrentStatusDownloading {
+				continue
+			}
+			if !t.Added.IsZero() && t.Added.After(graceCutoff) {
+				continue
+			}
+
+			key := "torbox-stuck:" + strings.ToLower(t.InfoHash)
+			j.mu.Lock()
+			_, inCooldown := j.acted[key]
+			j.mu.Unlock()
+			if inCooldown {
+				continue
+			}
+
+			if err := client.DeleteTorrent(t.Id); err != nil {
+				j.logger.Warn().Err(err).Str("torrent_id", t.Id).Str("name", truncate(t.Name, 80)).Msg("TorBox sweep: DeleteTorrent failed")
+				continue
+			}
+
+			j.mu.Lock()
+			j.acted[key] = now
+			j.mu.Unlock()
+			acted++
+			deleted++
+
+			j.logger.Info().
+				Str("torrent_id", t.Id).
+				Str("name", truncate(t.Name, 80)).
+				Time("added", t.Added).
+				Msg("TorBox sweep: deleted stuck downloading torrent")
+		}
+	}
+
+	if deleted > 0 {
+		j.logger.Info().
+			Int("scanned", scanned).
+			Int("deleted", deleted).
+			Msg("TorBox active-download sweep complete")
+	}
+}
+
+// SweepTorboxActiveDownloads runs the TorBox active-download sweep once,
+// outside the periodic loop. Used by the manual /api/janitor/torbox-sweep
+// HTTP endpoint so callers (e.g. the archive pipeline in
+// private-fallback-search) can try to free a slot before submitting work.
+func (j *QueueJanitor) SweepTorboxActiveDownloads() {
+	j.sweepTorboxActiveDownloads(time.Now())
 }
 
 // sweepDecypharrImported walks Decypharr's queue for pausedUP entries
