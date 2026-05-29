@@ -214,13 +214,14 @@ func (r *Repair) probeCandidates(ctx context.Context, run *storage.RepairRun, ca
 
 // orphanProbe handles candidates whose Decypharr storage entry was
 // already deleted (sync-driven removal) but whose arr library symlink
-// still exists. We have no item.Files to walk; we just lstat each
-// contentMap file's TargetPath and mark broken when missing.
+// still exists. We have no item.Files to walk; we just stat each
+// contentMap file's symlink path and mark broken when the resolved
+// target is missing.
 func (r *Repair) orphanProbe(c *candidate) []fileResult {
 	results := make([]fileResult, 0, len(c.contentMap))
 	for _, f := range c.contentMap {
 		fr := fileResult{name: f.Name}
-		broken, reason := checkSymlinkTargetMissing(f.TargetPath)
+		broken, reason := checkArrSymlinkBroken(f.Path)
 		if broken {
 			fr.broken = true
 			fr.reason = reason
@@ -236,18 +237,24 @@ func (r *Repair) orphanProbe(c *candidate) []fileResult {
 	return results
 }
 
-// checkSymlinkTargetMissing is the universal correctness check for a
-// library symlink: stat the resolved target (NOT the symlink itself).
-// Returns (broken=true, reason) when the target is missing or
-// unreachable; (false, "") when reachable. ErrNotExist is the
-// authoritative debrid-loss signal; other errors are conservatively
-// surfaced as broken with the underlying message — the two-pass
-// confirmation gate prevents acting on a single transient.
-func checkSymlinkTargetMissing(targetPath string) (bool, string) {
-	if targetPath == "" {
+// checkArrSymlinkBroken is the universal correctness check for a library
+// symlink. It stats the SYMLINK path itself (arr-side, e.g.
+// /data/media/movies/.../file.mkv) which causes os.Stat to follow the
+// link and reach the FUSE-served target — if the target is gone (debrid
+// dropped the file) the stat returns ErrNotExist.
+//
+// Returns (broken=true, reason) when the link resolves to nothing or
+// returns a non-ENOENT error; (false, "") when fully readable. The
+// two-pass confirmation gate suppresses single-stat transients.
+//
+// Empty input or os.Lstat-confirmed "not a symlink" is reported as
+// (false, "") — those aren't our concern here; collectArrFiles has
+// already filtered them out by the time we get here.
+func checkArrSymlinkBroken(symlinkPath string) (bool, string) {
+	if symlinkPath == "" {
 		return false, ""
 	}
-	if _, err := os.Stat(targetPath); err != nil {
+	if _, err := os.Stat(symlinkPath); err != nil {
 		if os.IsNotExist(err) {
 			return true, "target_missing"
 		}
@@ -375,7 +382,7 @@ func (r *Repair) overlaySymlinkTargetChecks(results []fileResult, c *candidate) 
 		byName[r.name] = i
 	}
 	for _, f := range c.contentMap {
-		broken, reason := checkSymlinkTargetMissing(f.TargetPath)
+		broken, reason := checkArrSymlinkBroken(f.Path)
 		if !broken {
 			continue
 		}
