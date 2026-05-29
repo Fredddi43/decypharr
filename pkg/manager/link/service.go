@@ -436,3 +436,13 @@ func (s *Service) invalidateAndRefetch(ctx context.Context, entry *storage.Entry
 func (s *Service) Clear() {
 	s.validated.Clear()
 }
+
+// RefreshLink invalidates the cached download link for the given torrent and
+// re-fetches a fresh URL from the debrid backend. Used by the streaming path
+// when an HTTP request to the stream URL fails with 404/410 (typically the
+// signal that the debrid-issued URL has expired before our periodic refresh
+// got to it). Thin wrapper around invalidateAndRefetch so the streaming code
+// in pkg/manager can trigger a refresh without an in-package back-door.
+func (s *Service) RefreshLink(ctx context.Context, entry *storage.Entry, link types.DownloadLink) (types.DownloadLink, error) {
+	return s.invalidateAndRefetch(ctx, entry, link, 0)
+}

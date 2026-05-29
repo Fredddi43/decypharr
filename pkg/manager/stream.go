@@ -211,6 +211,34 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 		return reqErr
 	}
 
+	// Debrid-issued stream URLs are time-limited (RealDebrid ~60min). The
+	// periodic refresh worker catches most expiries before reads hit them,
+	// but a long-running playback can race the refresh and get 404/410 mid-
+	// stream — which used to wedge the file for ~65min (until the next
+	// scheduled refresh). Detect that case here, force-refresh the URL via
+	// the debrid API, and retry once before bubbling EIO up to FUSE.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		expiredStatus := resp.StatusCode
+		resp.Body.Close()
+		m.logger.Warn().
+			Str("filename", filename).
+			Int("status", expiredStatus).
+			Msg("Stream URL appears expired; refreshing from debrid and retrying once")
+		freshLink, refreshErr := m.linkService.RefreshLink(ctx, torrent, downloadLink)
+		if refreshErr != nil {
+			return retry.Unrecoverable(StreamError{
+				Err:       fmt.Errorf("stream URL %d and refresh failed: %w", expiredStatus, refreshErr),
+				Retryable: false,
+				LinkError: true,
+			})
+		}
+		downloadLink = freshLink
+		resp, reqErr = m.doRequest(ctx, downloadLink.DownloadLink, start, end)
+		if reqErr != nil {
+			return reqErr
+		}
+	}
+
 	// Got response - check status
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
 		var header http.Header
