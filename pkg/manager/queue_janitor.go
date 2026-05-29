@@ -565,15 +565,23 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 //
 // Safe to call from both the periodic janitor sweep and from
 // submitNewTorrentAsync's eager path.
+//
+// Cooldown invalidation: when the arr blocklists + re-searches a release,
+// it may grab the EXACT SAME infohash again from a different indexer (or
+// the same indexer if the release was multi-indexed). That creates a
+// fresh Decypharr Entry with a newer CreatedAt. If the cooldown was set
+// before the re-grab arrived, ignore it — this is genuinely a new event,
+// not a duplicate. Without this check, the second (and third, fourth…)
+// rejection of the same hash sits in state=error indefinitely.
 func (j *QueueJanitor) dropPermanentlyRejected(entry *storage.Entry) (blocklisted bool, dropped bool) {
 	if entry == nil {
 		return
 	}
 	key := "decypharr:" + strings.ToLower(entry.InfoHash)
 	j.mu.Lock()
-	_, inCooldown := j.acted[key]
+	actedAt, inCooldown := j.acted[key]
 	j.mu.Unlock()
-	if inCooldown {
+	if inCooldown && !entry.CreatedAt.After(actedAt) {
 		return
 	}
 
