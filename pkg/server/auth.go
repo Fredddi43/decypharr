@@ -84,26 +84,36 @@ func (s *Server) generateAPIToken() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-// refreshAPIToken generates a new API token and saves it
+// refreshAPIToken generates a new API token and saves it.
+//
+// Failures here are user-visible on the settings page, so each step returns
+// a specific error message that gets passed through to the frontend toast.
+// "Failed to refresh token: Failed to refresh token" (the old generic
+// frontend fallback) gave no clue which step actually broke.
 func (s *Server) refreshAPIToken() (string, error) {
-	auth := config.Get().GetAuth()
-	if auth == nil {
-		return "", fmt.Errorf("authentication not configured")
+	cfg := config.Get()
+	if !cfg.UseAuth {
+		return "", fmt.Errorf("authentication is disabled in config; enable it on the setup page before issuing API tokens")
 	}
 
-	// Generate new token
+	auth := cfg.GetAuth()
+	if auth == nil {
+		// UseAuth was true but the file/object came back nil — likely a
+		// corrupt or unreadable auth.json. Start fresh so the user can
+		// re-bootstrap, but flag it loudly.
+		s.logger.Warn().Str("auth_file", cfg.AuthFile()).Msg("Auth config nil despite UseAuth=true; initialising empty struct")
+		auth = &config.Auth{}
+	}
+
 	token, err := s.generateAPIToken()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("generate token: %w", err)
 	}
 
-	// Update auth config
 	auth.APIToken = token
 
-	// Save auth config
-	if err := config.Get().SaveAuth(auth); err != nil {
-		return "", err
+	if err := cfg.SaveAuth(auth); err != nil {
+		return "", fmt.Errorf("write %s: %w", cfg.AuthFile(), err)
 	}
-
 	return token, nil
 }

@@ -1677,7 +1677,12 @@
             });
 
             if (!response.ok) {
-                throw new Error('Failed to refresh token');
+                // Surface the server's specific error (e.g. "write
+                // /app/auth.json: permission denied") instead of the
+                // useless generic "Failed to refresh token" that masked
+                // every cause of failure.
+                const detail = (await response.text()).trim() || `HTTP ${response.status}`;
+                throw new Error(detail);
             }
 
             const data = await response.json();

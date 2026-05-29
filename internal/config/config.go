@@ -391,13 +391,45 @@ func (c *Config) GetAuth() *Auth {
 	return c.Auth
 }
 
+// SaveAuth persists auth state via tmp-file + atomic rename so a process
+// crash mid-write can't leave auth.json half-written (which would lock the
+// user out — the GUI's refresh-token loop has been observed to fail with no
+// detail when the file is unreadable, see handleRefreshAPIToken).
 func (c *Config) SaveAuth(auth *Auth) error {
 	c.Auth = auth
 	data, err := json.Marshal(auth)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal auth: %w", err)
 	}
-	return os.WriteFile(c.AuthFile(), data, 0644)
+	target := c.AuthFile()
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("ensure config dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".auth.json.*")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup if we bail before rename.
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("fsync tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return fmt.Errorf("chmod tmp: %w", err)
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("rename to %s: %w", target, err)
+	}
+	return nil
 }
 
 func (c *Config) NeedsAuth() bool {
