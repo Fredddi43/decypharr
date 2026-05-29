@@ -249,10 +249,130 @@ func (j *QueueJanitor) runPass(ctx context.Context) {
 	// Replaces the dead upstream arr.Cleanup flag.
 	j.sweepDecypharrImported(ctx, arrs, now)
 
+	// Decypharr-side: drain pausedUP entries the arr has NO record of at all
+	// (no grab history, no queue entry) — these are zombies that the
+	// imported-paused sweep refuses to touch because they were never
+	// "already imported".
+	j.sweepDecypharrOrphans(arrs, now)
+
 	// TorBox-side: drain torrents stuck in `downloading` state. None should
 	// exist with download_uncached disabled, but arr-side races occasionally
 	// leave entries hogging the 3-slot active-download cap forever.
 	j.sweepTorboxActiveDownloads(now)
+}
+
+// orphanMinAge returns the minimum age before a pausedUP entry with no
+// arr history is considered safe to delete. Conservative default of 24h
+// keeps brand-new imports out of scope.
+func (j *QueueJanitor) orphanMinAge() time.Duration {
+	h := j.cfg().OrphanMinAgeHours
+	if h <= 0 {
+		h = 24
+	}
+	return time.Duration(h) * time.Hour
+}
+
+// sweepDecypharrOrphans drops pausedUP Decypharr entries that the arr
+// has no grab-history record for at all. Different from
+// sweepDecypharrImported (which HIDES entries the arr already imported
+// while preserving the FUSE-served files): these aren't hidden-worthy,
+// they're zombies. The arr never knew about the download, no symlink
+// was ever created in the library, nothing imports them, and they sit
+// in Decypharr's qBit-compat /torrents/info forever.
+//
+// Witnessed live: two 5-day-old radarr-category pausedUP entries with
+// `radarr queue hits: 0`, `radarr history hits: 0`, and a content_path
+// that didn't exist in the radarr container. The imported-paused sweep
+// refused them (HasCurrentFileForDownloadID returns false → skip), so
+// they camped indefinitely. This sweep finally drains them.
+//
+// Conservative: only acts on entries older than orphan_min_age_hours
+// (default 24h) so a brand-new entry mid-import isn't misclassified
+// during the small window where the arr has the download in its queue
+// but no grab event yet.
+func (j *QueueJanitor) sweepDecypharrOrphans(arrs []*arr.Arr, now time.Time) {
+	ageCutoff := now.Add(-j.orphanMinAge())
+
+	paused := j.manager.queue.ListFilter("", config.ProtocolAll, storage.EntryStatePausedUP, nil, "", true)
+	if len(paused) == 0 {
+		return
+	}
+
+	arrByName := make(map[string]*arr.Arr, len(arrs))
+	for _, a := range arrs {
+		if a != nil && a.Name != "" {
+			arrByName[strings.ToLower(a.Name)] = a
+		}
+	}
+
+	acted, dropped := 0, 0
+	maxActs := j.maxPerRun()
+
+	for _, entry := range paused {
+		if acted >= maxActs {
+			break
+		}
+		if entry == nil {
+			continue
+		}
+		// Age gate — use AddedOn (debrid-side add time) when populated,
+		// fall back to CreatedAt (manager-side).
+		ts := entry.AddedOn
+		if ts.IsZero() {
+			ts = entry.CreatedAt
+		}
+		if !ts.IsZero() && ts.After(ageCutoff) {
+			continue
+		}
+
+		a := arrByName[strings.ToLower(entry.Category)]
+		if a == nil {
+			continue // unknown category — out of scope
+		}
+
+		key := "decypharr-orphan:" + strings.ToLower(entry.InfoHash)
+		j.mu.Lock()
+		actedAt, inCooldown := j.acted[key]
+		j.mu.Unlock()
+		if inCooldown && !entry.CreatedAt.After(actedAt) {
+			continue
+		}
+
+		histID, err := a.FindGrabHistoryByDownloadID(entry.InfoHash)
+		if err != nil {
+			j.logger.Debug().Err(err).Str("arr", a.Name).Str("hash", entry.InfoHash).Msg("orphan-check: history lookup failed")
+			continue
+		}
+		if histID > 0 {
+			continue // arr has a grab record; not orphan, leave for other sweeps
+		}
+
+		// No arr record at all. Drop from Decypharr.
+		if err := j.manager.queue.Delete(entry.InfoHash, nil); err != nil && !strings.Contains(err.Error(), "not found") {
+			j.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("orphan drop: queue.Delete failed")
+			continue
+		}
+
+		j.mu.Lock()
+		j.acted[key] = now
+		j.mu.Unlock()
+		acted++
+		dropped++
+
+		j.logger.Info().
+			Str("hash", entry.InfoHash).
+			Str("category", entry.Category).
+			Str("name", truncate(entry.Name, 80)).
+			Time("added", ts).
+			Msg("Dropped Decypharr orphan entry (no arr history)")
+	}
+
+	if dropped > 0 {
+		j.logger.Info().
+			Int("paused_entries", len(paused)).
+			Int("dropped", dropped).
+			Msg("Decypharr orphan sweep complete")
+	}
 }
 
 // torboxSweepGrace returns the grace window for the TorBox sweep, falling

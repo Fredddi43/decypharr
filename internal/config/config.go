@@ -225,6 +225,7 @@ type QueueJanitorConfig struct {
 	GraceMinutes        int      `json:"grace_minutes,omitempty"`         // default 60
 	CooldownHours       int      `json:"cooldown_hours,omitempty"`        // default 24
 	MaxPerRun           int      `json:"max_per_run,omitempty"`           // default 10
+	OrphanMinAgeHours   int      `json:"orphan_min_age_hours,omitempty"`  // default 24
 	FailedPatterns      []string `json:"failed_patterns,omitempty"`       // override built-in defaults
 	AlreadyHavePatterns []string `json:"already_have_patterns,omitempty"` // override built-in defaults
 

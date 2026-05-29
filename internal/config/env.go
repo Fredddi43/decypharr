@@ -169,6 +169,11 @@ func (c *Config) applyQueueJanitorEnvVars() {
 			c.QueueJanitor.MaxPerRun = n
 		}
 	}
+	if v := getEnv("QUEUE_JANITOR__ORPHAN_MIN_AGE_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.QueueJanitor.OrphanMinAgeHours = n
+		}
+	}
 	if v := getEnv("QUEUE_JANITOR__TORBOX_SWEEP__ENABLED"); v != "" {
 		c.QueueJanitor.TorboxSweep.Enabled = parseBool(v)
 	}
