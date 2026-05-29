@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 
@@ -28,6 +29,13 @@ type candidate struct {
 	arrName    string
 	arrKind    storage.ArrKind
 	contentMap map[string]arr.ContentFile // file_name -> Arr metadata when source=arr
+
+	// orphan == true: the arr knows about a library file at this entry name,
+	// but Decypharr has no matching storage entry. Either the sync layer
+	// already deleted the entry (debrid lost the file) or storage was
+	// purged for some other reason. We still want to probe the symlink
+	// target on disk and, if broken, ask the arr to re-grab.
+	orphan bool
 }
 
 // healCache memoizes per-infohash auto-heal results within one sweep so
@@ -93,12 +101,17 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		return
 	}
 
+	// librarySize is the denominator for the circuit-breaker percentage
+	// gate — total entries enumerated this sweep, BEFORE filterDueCandidates
+	// drops already-fresh ones. Captured here so the gate sees the full arr
+	// library and not just the small subset due this pass.
+	librarySize := len(candidates)
 	due, skipped := r.filterDueCandidates(candidates, opts.IgnoreLastChecked)
 	run.Stats.Candidates = len(due)
 	run.Stats.SkippedFresh = skipped
 	run.Stage = storage.RepairStageProbing
 	r.saveRun(run)
-	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Msg("Sweep: probing")
+	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Int("library_size", librarySize).Msg("Sweep: probing")
 
 	heal := newHealCache()
 
@@ -122,9 +135,29 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		autoRepair = *opts.AutoRepair
 	}
 	if autoRepair {
-		run.Stage = storage.RepairStageRepairing
-		r.saveRun(run)
-		r.repairBroken(ctx, run, healths)
+		// Two safety gates before we let repairBroken touch any arr file:
+		//
+		// Gate 1 (filterReadyToRepair): drop broken healths that haven't
+		// crossed the two-pass confirmation threshold yet. Single-pass
+		// transients (FUSE blip / debrid auth glitch) leave on the next
+		// sweep without ever issuing a DELETE to the arr.
+		//
+		// Gate 2 (applyCircuitBreaker): if the absolute or percentage
+		// thresholds are breached for this sweep, refuse to repair
+		// ANYTHING this run; persist a sticky RepairAlert; operator must
+		// investigate or one-shot override.
+		ready := r.filterReadyToRepair(healths, log)
+		log.Info().Int("ready_to_repair", ready.Size()).Int("total_broken", run.Stats.Broken).Msg("Sweep: ready-to-repair count after two-pass gate")
+		blocked, breakerErr := r.applyCircuitBreaker(run, ready, librarySize, log)
+		if blocked {
+			log.Error().Err(breakerErr).Msg("Sweep: repair ABORTED by circuit breaker — no actions taken")
+		} else if r.dryRun() {
+			log.Warn().Int("would_repair", ready.Size()).Msg("Sweep: dry-run mode ON — logging verdicts but NOT calling repairBroken. Flip DECYPHARR_REPAIR__BROKEN_DETECTION_DRY_RUN=false to enable real repairs.")
+		} else {
+			run.Stage = storage.RepairStageRepairing
+			r.saveRun(run)
+			r.repairBroken(ctx, run, ready)
+		}
 	}
 	if ctx.Err() != nil {
 		r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
@@ -179,13 +212,77 @@ func (r *Repair) probeCandidates(ctx context.Context, run *storage.RepairRun, ca
 	return out, g.Wait()
 }
 
+// orphanProbe handles candidates whose Decypharr storage entry was
+// already deleted (sync-driven removal) but whose arr library symlink
+// still exists. We have no item.Files to walk; we just lstat each
+// contentMap file's TargetPath and mark broken when missing.
+func (r *Repair) orphanProbe(c *candidate) []fileResult {
+	results := make([]fileResult, 0, len(c.contentMap))
+	for _, f := range c.contentMap {
+		fr := fileResult{name: f.Name}
+		broken, reason := checkSymlinkTargetMissing(f.TargetPath)
+		if broken {
+			fr.broken = true
+			fr.reason = reason
+		} else if reason == "" {
+			// Symlink target IS readable on disk even though Decypharr
+			// has no storage entry for it. Don't make claims about
+			// healthiness in the absence of debrid metadata; report
+			// unknown so the rollup is conservative.
+			fr.reason = "orphan_target_readable"
+		}
+		results = append(results, fr)
+	}
+	return results
+}
+
+// checkSymlinkTargetMissing is the universal correctness check for a
+// library symlink: stat the resolved target (NOT the symlink itself).
+// Returns (broken=true, reason) when the target is missing or
+// unreachable; (false, "") when reachable. ErrNotExist is the
+// authoritative debrid-loss signal; other errors are conservatively
+// surfaced as broken with the underlying message — the two-pass
+// confirmation gate prevents acting on a single transient.
+func checkSymlinkTargetMissing(targetPath string) (bool, string) {
+	if targetPath == "" {
+		return false, ""
+	}
+	if _, err := os.Stat(targetPath); err != nil {
+		if os.IsNotExist(err) {
+			return true, "target_missing"
+		}
+		return true, "target_stat_error: " + err.Error()
+	}
+	return false, ""
+}
+
 // probeEntry probes one entry: marks it repairing, probes its files (≤2 in
 // parallel), runs auto-heal on broken torrents, then persists final health.
 func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache) *storage.EntryHealth {
 	s := r.manager.storage
-	h, _ := s.GetEntryHealth(c.item.Name)
+
+	// Resolve the entry name. For orphan candidates c.item is nil; use the
+	// shared EntryName from any contentMap file (collectArrMediaCandidates
+	// stamps it consistently).
+	entryName := ""
+	if c.item != nil {
+		entryName = c.item.Name
+	} else {
+		for _, f := range c.contentMap {
+			if f.EntryName != "" {
+				entryName = f.EntryName
+				break
+			}
+		}
+	}
+	if entryName == "" {
+		// Defensive — should be impossible at this point but don't crash.
+		return &storage.EntryHealth{Status: storage.HealthUnknown, FailureReason: "no_entry_name"}
+	}
+
+	h, _ := s.GetEntryHealth(entryName)
 	if h == nil {
-		h = &storage.EntryHealth{EntryName: c.item.Name}
+		h = &storage.EntryHealth{EntryName: entryName}
 	}
 	previous := h.Status
 
@@ -196,18 +293,36 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.Protocol = ""
 	r.saveHealth(h)
 
-	names := orderedFilenames(c.item)
-	results := r.probeFiles(ctx, c.item, names)
-	r.autoHealResults(ctx, results, heal)
+	var results []fileResult
+	var nameCount int
+	if c.orphan {
+		// Orphan: no Decypharr storage entry; just lstat each arr-side
+		// symlink target and decide on that alone. Skip autoHeal — there's
+		// no debrid placement to re-insert into.
+		results = r.orphanProbe(c)
+		nameCount = len(c.contentMap)
+	} else {
+		names := orderedFilenames(c.item)
+		results = r.probeFiles(ctx, c.item, names)
+		// Universal correctness check: even if Decypharr's metadata
+		// thinks this entry is fine, if the arr-side symlink target is
+		// missing on disk we want to know. Override healthy → broken when
+		// the FS says otherwise. The FS is authoritative.
+		results = r.overlaySymlinkTargetChecks(results, c)
+		r.autoHealResults(ctx, results, heal)
+		nameCount = len(names)
+	}
 
 	broken := r.brokenFiles(c, results)
 	final := rollupStatus(results)
 
 	h.Status = final
-	h.FileCount = len(names)
+	h.FileCount = nameCount
 	h.BrokenFiles = broken
 	h.BrokenCount = len(broken)
-	h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
+	if c.item != nil {
+		h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
+	}
 	h.LastCheckedAt = time.Now()
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
 	h.Dirty = false
@@ -217,6 +332,21 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	if proto := firstProtocol(results); proto != "" {
 		h.Protocol = proto
 	}
+
+	// Two-pass confirmation gate: track consecutive broken-detections per
+	// entry. Only let the candidate graduate to repairBroken once
+	// BrokenConsecutive >= the configured threshold (default 2). Reset
+	// the counter whenever the entry is healthy again.
+	if final == storage.HealthBroken {
+		if h.BrokenSince.IsZero() {
+			h.BrokenSince = h.LastCheckedAt
+		}
+		h.BrokenConsecutive++
+	} else {
+		h.BrokenConsecutive = 0
+		h.BrokenSince = time.Time{}
+	}
+
 	switch final {
 	case storage.HealthHealthy:
 		h.LastOKAt = h.LastCheckedAt
@@ -228,6 +358,46 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	r.saveHealth(h)
 	return h
+}
+
+// overlaySymlinkTargetChecks supplements an existing slice of fileResults
+// with a per-file lstat of the arr-side symlink target. If the FS says
+// the target is missing we override the result to broken — this catches
+// the case where Decypharr's debrid metadata still claims healthy but
+// the FUSE-backed file has actually been removed.
+func (r *Repair) overlaySymlinkTargetChecks(results []fileResult, c *candidate) []fileResult {
+	if c == nil || len(c.contentMap) == 0 {
+		return results
+	}
+	// Index existing results by file name for an O(n+m) merge.
+	byName := make(map[string]int, len(results))
+	for i, r := range results {
+		byName[r.name] = i
+	}
+	for _, f := range c.contentMap {
+		broken, reason := checkSymlinkTargetMissing(f.TargetPath)
+		if !broken {
+			continue
+		}
+		// Find a matching result (by ContentFile.Name) and override; if
+		// none, append a synthetic broken result so the rollup picks it up.
+		idx, ok := byName[f.Name]
+		if ok {
+			if results[idx].broken && results[idx].reason != "" {
+				continue // already broken with a more specific reason
+			}
+			results[idx].broken = true
+			results[idx].healthy = false
+			results[idx].reason = reason
+		} else {
+			results = append(results, fileResult{
+				name:   f.Name,
+				broken: true,
+				reason: reason,
+			})
+		}
+	}
+	return results
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
@@ -672,8 +842,25 @@ func (r *Repair) collectArrMediaCandidates(ctx context.Context, a *arr.Arr, medi
 		for entryPath, files := range collectArrFiles(content) {
 			name := filepath.Clean(filepath.Base(entryPath))
 			item, err := r.manager.GetEntryItem(name)
-			if err != nil || item == nil {
-				continue
+			// `item == nil` used to be a hard `continue`, which made any
+			// dangling library symlink invisible to the sweep the moment
+			// Decypharr's sync dropped its storage entry. We now emit an
+			// orphan candidate so probeFile gets a chance to lstat the
+			// target and (if missing) ask the arr to re-grab. err here
+			// represents storage-lookup transients, not "not found";
+			// short-circuit only on real failure.
+			isOrphan := false
+			if err != nil {
+				// Distinguish "doesn't exist" from "lookup failed". The
+				// hybrid store's Get returns ErrNotFound (or similar) for
+				// the not-exist case; treat it as orphan, surface anything
+				// else as a continue + warn.
+				if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+					continue
+				}
+				isOrphan = true
+			} else if item == nil {
+				isOrphan = true
 			}
 			c, ok := out[name]
 			if !ok {
@@ -682,6 +869,7 @@ func (r *Repair) collectArrMediaCandidates(ctx context.Context, a *arr.Arr, medi
 					arrName:    a.Name,
 					arrKind:    kind,
 					contentMap: make(map[string]arr.ContentFile),
+					orphan:     isOrphan,
 				}
 				out[name] = c
 			}
@@ -1356,4 +1544,124 @@ func arrKindFromType(t arr.Type) storage.ArrKind {
 	default:
 		return storage.ArrKindOther
 	}
+}
+
+// filterReadyToRepair returns the subset of probed entries that are
+// confirmed broken on >= brokenMinConsecutive consecutive sweeps. Single-
+// pass broken results (a FUSE blip or debrid auth glitch) are held back
+// — they stay in EntryHealth with BrokenConsecutive incremented and get
+// re-probed next sweep. If still broken then, they graduate. The two
+// passes are at least recheckInterval (default 1h) apart, so a real
+// debrid loss easily crosses the bar while a 30-second outage does not.
+func (r *Repair) filterReadyToRepair(healths *xsync.Map[string, *storage.EntryHealth], log zerolog.Logger) *xsync.Map[string, *storage.EntryHealth] {
+	threshold := r.brokenMinConsecutive()
+	ready := xsync.NewMap[string, *storage.EntryHealth]()
+	pending := 0
+	healths.Range(func(name string, h *storage.EntryHealth) bool {
+		if h == nil || h.Status != storage.HealthBroken {
+			return true
+		}
+		if h.BrokenConsecutive < threshold {
+			pending++
+			return true
+		}
+		ready.Store(name, h)
+		return true
+	})
+	if pending > 0 {
+		log.Info().
+			Int("pending_two_pass", pending).
+			Int("threshold", threshold).
+			Msg("Sweep: holding broken candidates for next-pass confirmation")
+	}
+	return ready
+}
+
+// circuitBreakerVerdict is the pure decision of the circuit breaker.
+// Inputs: how many entries the gate is being asked to repair, the
+// library denominator, and the configured caps/override. Returns:
+//   blocked=true with a reason ("abort_absolute" / "abort_percent")
+//   when either cap is exceeded. blocked=false otherwise. The
+//   side-effect-free shape makes this testable in isolation.
+func circuitBreakerVerdict(nBroken, librarySize, absCap int, pctCap float64, override bool) (blocked bool, reason, threshold string, pct float64) {
+	if override {
+		return false, "", "", 0
+	}
+	if nBroken == 0 {
+		return false, "", "", 0
+	}
+	if librarySize > 0 {
+		pct = 100.0 * float64(nBroken) / float64(librarySize)
+	}
+	switch {
+	case nBroken > absCap:
+		return true, "abort_absolute", fmt.Sprintf("%d", absCap), pct
+	case pct > pctCap:
+		return true, "abort_percent", fmt.Sprintf("%.2f%%", pctCap), pct
+	default:
+		return false, "", "", pct
+	}
+}
+
+// applyCircuitBreaker enforces the absolute-count and percentage-of-library
+// safety gates. Either threshold breached → abort: no actions taken this
+// sweep, RepairAlert persisted, loud ERROR log emitted. AbortOverride=true
+// bypasses both gates for ONE sweep (operator must re-set it for the next).
+//
+// Returns (blocked=true, reason) on abort; (false, nil) on green-light.
+func (r *Repair) applyCircuitBreaker(run *storage.RepairRun, ready *xsync.Map[string, *storage.EntryHealth], librarySize int, log zerolog.Logger) (bool, error) {
+	cfg := r.cfg()
+	if cfg.AbortOverride {
+		log.Warn().Msg("Sweep: circuit-breaker OVERRIDE flag set — bypassing safety gates for this run only")
+		return false, nil
+	}
+	nBroken := ready.Size()
+	if nBroken == 0 {
+		return false, nil
+	}
+	blocked, reason, threshold, pct := circuitBreakerVerdict(nBroken, librarySize, r.abortAbsolute(), r.abortPercent(), false)
+	if !blocked {
+		return false, nil
+	}
+
+	// Sample the broken entries so the operator can see what would have
+	// been touched — capped to 10 to keep the alert payload small.
+	sample := make([]storage.BrokenFile, 0, 10)
+	ready.Range(func(name string, h *storage.EntryHealth) bool {
+		if len(sample) >= 10 {
+			return false
+		}
+		if h == nil {
+			return true
+		}
+		if len(h.BrokenFiles) > 0 {
+			sample = append(sample, h.BrokenFiles[0])
+		} else {
+			sample = append(sample, storage.BrokenFile{EntryName: h.EntryName, Reason: h.FailureReason})
+		}
+		return true
+	})
+
+	alert := &storage.RepairAlert{
+		ID:          uuid.New().String(),
+		RunID:       run.ID,
+		Reason:      reason,
+		BrokenCount: nBroken,
+		LibrarySize: librarySize,
+		Threshold:   threshold,
+		CreatedAt:   time.Now(),
+		Sample:      sample,
+	}
+	if err := r.manager.storage.SaveRepairAlert(alert); err != nil {
+		log.Error().Err(err).Msg("Sweep: failed to persist RepairAlert (still aborting)")
+	}
+	log.Error().
+		Str("reason", reason).
+		Int("broken", nBroken).
+		Int("library_size", librarySize).
+		Float64("pct_broken", pct).
+		Str("threshold", threshold).
+		Str("alert_id", alert.ID).
+		Msg("CIRCUIT BREAKER: refusing to repair — investigate alert before clearing")
+	return true, fmt.Errorf("%s: %d/%d (%.2f%%) over %s", reason, nBroken, librarySize, pct, threshold)
 }

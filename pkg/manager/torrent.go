@@ -171,6 +171,18 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 					m.syncMissCounters.Delete(missKey)
 					entry.RemoveProvider(provider, nil)
 					if len(entry.Providers) == 0 {
+						// All providers have lost this entry — the storage
+						// record is about to be deleted. Write an
+						// EntryHealth tombstone first so the repair sweep
+						// can later recognise the now-orphan library
+						// symlink: EntryHealth lives in its own hybrid
+						// store and survives storage.Delete(). The
+						// tombstone carries enough metadata (Name as the
+						// EntryHealth key, Category to route to the right
+						// arr) for the repair pipeline to ask the arr to
+						// re-grab without ever needing to re-fetch the
+						// entry from a now-gone debrid.
+						m.writeSyncDeletionTombstone(entry, "debrid_sync_lost")
 						torrentsToDelete = append(torrentsToDelete, entry.InfoHash)
 					} else {
 						torrentsToUpdate = append(torrentsToUpdate, entry)
@@ -207,6 +219,51 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 	}
 
 	return newTorrents, torrentsToUpdate, torrentsToDelete, nil
+}
+
+// writeSyncDeletionTombstone records the fact that Decypharr is about to
+// drop an entry because every configured debrid lost it. The tombstone is
+// keyed by entry.Name in the EntryHealth store, so the repair sweep can
+// match it back to the arr library symlink that's about to dangle.
+//
+// We pre-seed BrokenConsecutive to BrokenMinConsecutive so the two-pass
+// confirmation gate fires on the very next sweep (no further wait
+// needed: the sync guard already required 3 consecutive miss-passes to
+// reach this point — at least 30 minutes of confidence).
+func (m *Manager) writeSyncDeletionTombstone(entry *storage.Entry, reason string) {
+	if entry == nil || entry.Name == "" {
+		return
+	}
+	repairCfg := config.Get().Repair
+	threshold := repairCfg.BrokenMinConsecutive
+	if threshold <= 0 {
+		threshold = 2
+	}
+	existing, _ := m.storage.GetEntryHealth(entry.Name)
+	if existing == nil {
+		existing = &storage.EntryHealth{EntryName: entry.Name}
+	}
+	now := time.Now()
+	existing.SyncTombstoneAt = now
+	existing.SyncTombstoneReason = reason
+	existing.SyncTombstoneCategory = entry.Category
+	existing.BrokenSince = now
+	if existing.BrokenConsecutive < threshold {
+		existing.BrokenConsecutive = threshold
+	}
+	existing.Protocol = entry.Protocol
+	existing.Dirty = true
+	existing.DirtyReason = reason
+	if err := m.storage.SaveEntryHealth(existing); err != nil {
+		m.logger.Warn().Err(err).Str("entry", entry.Name).Str("infohash", entry.InfoHash).Msg("Failed to write sync-deletion tombstone")
+		return
+	}
+	m.logger.Info().
+		Str("entry", entry.Name).
+		Str("infohash", entry.InfoHash).
+		Str("category", entry.Category).
+		Str("reason", reason).
+		Msg("Sync-deletion tombstone written; repair sweep will pick up the orphan symlink")
 }
 
 // handleTorrentDeletions processes torrent deletions concurrently

@@ -12,7 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs"}
+var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs", "repair_alerts"}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -20,13 +20,14 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
-	entries     *hybrid.Store
-	queue       *hybrid.Store
-	entryItems  *hybrid.Store
-	repairState *hybrid.Store
-	repairRuns  *hybrid.Store
-	dir         string
-	logger      zerolog.Logger
+	entries      *hybrid.Store
+	queue        *hybrid.Store
+	entryItems   *hybrid.Store
+	repairState  *hybrid.Store
+	repairRuns   *hybrid.Store
+	repairAlerts *hybrid.Store
+	dir          string
+	logger       zerolog.Logger
 }
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
@@ -82,13 +83,14 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	s := &Storage{
-		entries:     itemStores["entries"],
-		queue:       itemStores["queue"],
-		entryItems:  itemStores["items"],
-		repairState: itemStores["repair_state"],
-		repairRuns:  itemStores["repair_runs"],
-		dir:         dbPath,
-		logger:      log,
+		entries:      itemStores["entries"],
+		queue:        itemStores["queue"],
+		entryItems:   itemStores["items"],
+		repairState:  itemStores["repair_state"],
+		repairRuns:   itemStores["repair_runs"],
+		repairAlerts: itemStores["repair_alerts"],
+		dir:          dbPath,
+		logger:       log,
 	}
 
 	if count, err := s.MigrateMetadata(); err != nil {
@@ -102,7 +104,7 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns}
+	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns, s.repairAlerts}
 	for _, store := range stores {
 		if store == nil {
 			continue

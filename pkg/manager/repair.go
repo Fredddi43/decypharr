@@ -103,6 +103,40 @@ func (r *Repair) recheckInterval() time.Duration {
 	return d
 }
 
+// dryRun returns true when the operator has set BrokenDetectionDryRun.
+// In dry-run mode, the sweep still detects + classifies + applies the
+// circuit breaker, but never invokes repairBroken — no arr-side DELETE
+// or research is issued. Used to gain confidence in the detection
+// heuristics before flipping to live repairs.
+func (r *Repair) dryRun() bool { return r.cfg().BrokenDetectionDryRun }
+
+// brokenMinConsecutive is the two-pass gate threshold. Default 2 — a
+// single FUSE/debrid blip leaves on the next sweep without consuming
+// any repair action. Set to 1 to revert to single-detection behavior
+// (NOT recommended).
+func (r *Repair) brokenMinConsecutive() int {
+	if n := r.cfg().BrokenMinConsecutive; n > 0 {
+		return n
+	}
+	return 2
+}
+
+// abortAbsolute / abortPercent are the circuit-breaker thresholds.
+// Defaults: 25 absolute, 1.0%. Either threshold breached → ABORT.
+func (r *Repair) abortAbsolute() int {
+	if n := r.cfg().AbortAbsolute; n > 0 {
+		return n
+	}
+	return 25
+}
+
+func (r *Repair) abortPercent() float64 {
+	if f := r.cfg().AbortPercent; f > 0 {
+		return f
+	}
+	return 1.0
+}
+
 // Start registers the recurring sweep with the scheduler if repair is
 // enabled. It also reconciles any orphaned state left by a previous process:
 // runs marked running flip to cancelled; entries stuck on `repairing` revert

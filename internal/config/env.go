@@ -145,6 +145,31 @@ func (c *Config) applyEnvOverrides() {
 	}
 
 	c.applyQueueJanitorEnvVars()
+	c.applyRepairEnvVars()
+}
+
+func (c *Config) applyRepairEnvVars() {
+	if v := getEnv("REPAIR__BROKEN_DETECTION_DRY_RUN"); v != "" {
+		c.Repair.BrokenDetectionDryRun = parseBool(v)
+	}
+	if v := getEnv("REPAIR__ABORT_ABSOLUTE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Repair.AbortAbsolute = n
+		}
+	}
+	if v := getEnv("REPAIR__ABORT_PERCENT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Repair.AbortPercent = f
+		}
+	}
+	if v := getEnv("REPAIR__ABORT_OVERRIDE"); v != "" {
+		c.Repair.AbortOverride = parseBool(v)
+	}
+	if v := getEnv("REPAIR__BROKEN_MIN_CONSECUTIVE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Repair.BrokenMinConsecutive = n
+		}
+	}
 }
 
 func (c *Config) applyQueueJanitorEnvVars() {

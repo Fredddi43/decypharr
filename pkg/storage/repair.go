@@ -248,7 +248,48 @@ type EntryHealth struct {
 	ActiveRunID    string       `json:"active_run_id,omitempty"`
 	PreviousStatus HealthStatus `json:"previous_status,omitempty"`
 
+	// Two-pass-confirmation gate state. BrokenConsecutive counts how many
+	// consecutive sweeps have reported this entry's symlink target as
+	// missing. We only let it graduate to repairBroken once it crosses
+	// BrokenMinConsecutive (default 2) — a single FUSE blip / debrid
+	// timeout would otherwise be enough to delete the arr's moviefile.
+	// Reset to 0 whenever the symlink target resolves again or the entry
+	// gets successfully repaired.
+	BrokenConsecutive int       `json:"broken_consecutive,omitempty"`
+	BrokenSince       time.Time `json:"broken_since,omitempty"`
+	// SyncTombstoneAt is set by the sync-deletion path immediately before
+	// Decypharr drops the storage entry because the debrid no longer
+	// reports it. When non-zero, BrokenConsecutive is effectively seeded
+	// to the gate threshold (we already have high confidence: the sync
+	// guard required 3 consecutive misses to fire).
+	SyncTombstoneAt time.Time `json:"sync_tombstone_at,omitempty"`
+	// SyncTombstoneReason: free-form ("debrid_sync_lost", etc.).
+	SyncTombstoneReason string `json:"sync_tombstone_reason,omitempty"`
+	// SyncTombstoneCategory: the arr category at the time of the
+	// sync-deletion, used to look up the matching arr in repairBroken
+	// after the storage entry is gone.
+	SyncTombstoneCategory string `json:"sync_tombstone_category,omitempty"`
+
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// RepairAlert is a sticky operator-facing record persisted whenever the
+// circuit breaker aborts a sweep. The presence of any RepairAlert means
+// "the last repair attempt refused to act because something looked
+// catastrophically wrong; investigate before re-running". Cleared by
+// operator action (manual API call) or by a single sweep with
+// AbortOverride=true.
+type RepairAlert struct {
+	ID          string    `json:"id"`
+	RunID       string    `json:"run_id,omitempty"`
+	Reason      string    `json:"reason"`         // "abort_absolute" | "abort_percent"
+	BrokenCount int       `json:"broken_count"`
+	LibrarySize int       `json:"library_size"`
+	Threshold   string    `json:"threshold"`       // human-readable, e.g. "25" or "1.0%"
+	CreatedAt   time.Time `json:"created_at"`
+	// Sample BrokenFiles so the operator can immediately see what would
+	// have been touched. Capped to ~10 to keep the alert payload small.
+	Sample []BrokenFile `json:"sample,omitempty"`
 }
 
 // IsDue reports whether this entry should be visited by the next sweep, given a
@@ -382,6 +423,75 @@ func (s *Storage) MarkEntryDirty(entryName string, protocol config.Protocol, rea
 	state.DirtyReason = reason
 	state.NextCheckDueAt = time.Time{}
 	_ = s.SaveEntryHealth(state)
+}
+
+// --- RepairAlert ---
+// Persistent operator-facing alerts emitted by the repair sweep's circuit
+// breaker. The presence of any RepairAlert means a sweep refused to act
+// because the broken count crossed a safety threshold; the operator must
+// investigate (and either fix the underlying cause OR run with
+// AbortOverride=true once) before normal repair resumes.
+
+func (s *Storage) SaveRepairAlert(alert *RepairAlert) error {
+	if alert == nil || alert.ID == "" {
+		return fmt.Errorf("repair alert missing id")
+	}
+	if alert.CreatedAt.IsZero() {
+		alert.CreatedAt = time.Now()
+	}
+	data, err := json.Marshal(alert)
+	if err != nil {
+		return err
+	}
+	return s.repairAlerts.Put(alert.ID, data, nil)
+}
+
+func (s *Storage) ListRepairAlerts() ([]*RepairAlert, error) {
+	out := make([]*RepairAlert, 0)
+	err := s.repairAlerts.ForEach(func(key string, value []byte) error {
+		var a RepairAlert
+		if err := json.Unmarshal(value, &a); err != nil {
+			return nil
+		}
+		if a.ID == "" {
+			a.ID = key
+		}
+		out = append(out, &a)
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, err
+}
+
+func (s *Storage) DeleteRepairAlert(id string) error {
+	if id == "" {
+		return nil
+	}
+	if !s.repairAlerts.Exists(id) {
+		return nil
+	}
+	return s.repairAlerts.Delete(id)
+}
+
+func (s *Storage) ClearRepairAlerts() error {
+	keys := make([]string, 0)
+	_ = s.repairAlerts.ForEach(func(key string, _ []byte) error {
+		keys = append(keys, key)
+		return nil
+	})
+	for _, k := range keys {
+		_ = s.repairAlerts.Delete(k)
+	}
+	return nil
+}
+
+func (s *Storage) HasRepairAlerts() bool {
+	has := false
+	_ = s.repairAlerts.ForEach(func(_ string, _ []byte) error {
+		has = true
+		return fmt.Errorf("stop") // short-circuit
+	})
+	return has
 }
 
 // CountEntryHealthByStatus returns a per-status histogram without loading full

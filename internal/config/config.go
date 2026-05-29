@@ -136,12 +136,24 @@ type RepairConfig struct {
 	Arrs                  []string     `json:"arrs,omitempty"`
 	AutoRepair            bool         `json:"auto_repair,omitempty"`
 	NotifyOnComplete      bool         `json:"notify_on_complete,omitempty"`
+
+	// Dangling-symlink detection safeguards. The repair sweep can detect
+	// arr library symlinks whose FUSE target is gone (debrid-side deletion
+	// after sync drop) and ask the arr to remove the moviefile/episodefile
+	// + re-search. These knobs gate that action because a misclassification
+	// here is catastrophic (mass library nuke).
+	BrokenDetectionDryRun bool    `json:"broken_detection_dry_run,omitempty"`     // default true on first deploy; logs verdicts but never DELETEs.
+	AbortAbsolute         int     `json:"abort_absolute,omitempty"`               // default 25; per-sweep cap on broken candidates before HARD ABORT.
+	AbortPercent          float64 `json:"abort_percent,omitempty"`                // default 1.0; per-sweep cap as % of arr library size.
+	AbortOverride         bool    `json:"abort_override,omitempty"`               // one-shot bypass for both gates (operator-set after investigation).
+	BrokenMinConsecutive  int     `json:"broken_min_consecutive,omitempty"`       // default 2; require N consecutive sweeps reporting broken before acting (1 = act on first detection, NOT recommended).
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.NotifyOnComplete
+		!r.AutoRepair && !r.NotifyOnComplete &&
+		!r.BrokenDetectionDryRun && r.AbortAbsolute == 0 && r.AbortPercent == 0 && !r.AbortOverride && r.BrokenMinConsecutive == 0
 }
 
 type Config struct {
