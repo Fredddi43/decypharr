@@ -953,16 +953,3 @@ func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
 		"message": "Authentication settings updated successfully",
 	}, http.StatusOK)
 }
-
-// handleJanitorTorboxSweep runs the TorBox active-download sweep once,
-// out-of-band of the scheduled janitor pass. Used by the archive pipeline
-// to try to free a TorBox slot before submitting a new WebDL upload.
-func (s *Server) handleJanitorTorboxSweep(w http.ResponseWriter, r *http.Request) {
-	j := s.manager.QueueJanitor()
-	if j == nil {
-		http.Error(w, "Queue janitor not initialised", http.StatusServiceUnavailable)
-		return
-	}
-	go j.SweepTorboxActiveDownloads()
-	utils.JSONResponse(w, map[string]string{"status": "sweep scheduled"}, http.StatusAccepted)
-}

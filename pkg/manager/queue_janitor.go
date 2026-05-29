@@ -369,13 +369,6 @@ func (j *QueueJanitor) sweepTorboxActiveDownloads(now time.Time) {
 	}
 }
 
-// SweepTorboxActiveDownloads runs the TorBox active-download sweep once,
-// outside the periodic loop. Used by the manual /api/janitor/torbox-sweep
-// HTTP endpoint so callers (e.g. the archive pipeline in
-// private-fallback-search) can try to free a slot before submitting work.
-func (j *QueueJanitor) SweepTorboxActiveDownloads() {
-	j.sweepTorboxActiveDownloads(time.Now())
-}
 
 // sweepDecypharrImported walks Decypharr's queue for pausedUP entries
 // whose arr has already recorded a downloadFolderImported event for the
