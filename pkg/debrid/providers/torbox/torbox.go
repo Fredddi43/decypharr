@@ -497,12 +497,26 @@ func (tb *Torbox) CheckStatus(torrent *types.Torrent) (*types.Torrent, error) {
 }
 
 func (tb *Torbox) DeleteTorrent(torrentId string) error {
-	payload := map[string]string{"torrent_id": torrentId, "action": "Delete"}
-
-	resp, err := tb.doDelete(fmt.Sprintf("/api/torrents/controltorrent/%s", torrentId), payload)
+	// TorBox's controltorrent endpoint moved from DELETE to POST and renamed
+	// `action: "Delete"` to `operation: "delete"`. The old form returns 404 +
+	// 422 (depending on which legacy URL shape you try), so the janitor sweep
+	// silently failed to delete anything until this was corrected. The id no
+	// longer goes in the URL path — it's required in the JSON body.
+	payload := map[string]string{"torrent_id": torrentId, "operation": "delete"}
+	data, err := json.ConfigDefault.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	req, err := http.NewRequest(http.MethodPost, tb.Host+"/api/torrents/controltorrent", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tb.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
