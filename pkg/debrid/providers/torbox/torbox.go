@@ -298,25 +298,25 @@ func (tb *Torbox) getTorboxStatus(status string, finished bool) types.TorrentSta
 	if finished {
 		return types.TorrentStatusDownloaded
 	}
+
+	// finished=False from here. Even if TorBox reports a "done-ish" raw
+	// state like "uploading" or "completed", treat it as stuck — the
+	// authoritative signal is `download_finished`. Without this, "uploading
+	// (no peers)" with finished=False used to map to Downloaded and slip
+	// past the queue janitor's stuck-torrent sweep.
 	downloading := []string{"paused", "downloading",
 		"checkingResumeData", "metaDL", "pausedUP", "queuedUP", "checkingUP",
 		"forcedUP", "allocating", "downloading", "metaDL", "pausedDL",
 		"queuedDL", "checkingDL", "forcedDL", "checkingResumeData", "moving"}
 
-	downloaded := []string{
-		"completed", "cached", "uploading", "downloaded",
-	}
-
 	status = regexp.MustCompile(`\s*\(.*?\)\s*`).ReplaceAllString(status, "")
 
-	switch {
-	case utils.Contains(downloading, status):
+	if utils.Contains(downloading, status) {
 		return types.TorrentStatusDownloading
-	case utils.Contains(downloaded, status):
-		return types.TorrentStatusDownloaded
-	default:
-		return types.TorrentStatusError
 	}
+	// stalled / checking (bare) / incomplete / expired / uploading-without-
+	// finished / etc. — none of these progress on their own.
+	return types.TorrentStatusError
 }
 
 func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {

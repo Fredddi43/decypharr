@@ -274,9 +274,15 @@ func (j *QueueJanitor) torboxSweepMaxPerRun() int {
 }
 
 // sweepTorboxActiveDownloads queries every configured TorBox provider for
-// torrents stuck in `downloading` state past the grace window and deletes
-// them. WebDL entries (the private-tracker archive pipeline) live in a
-// separate TorBox listing and are NOT touched.
+// torrents that are NOT in a finished state past the grace window and
+// deletes them. The TorBox provider mapping returns Downloaded ONLY when
+// download_finished=True; everything else maps to Downloading (actively
+// trying) or Error (stalled / checking / incomplete / expired /
+// uploading-without-finished). All non-finished states count against the
+// per-plan active-download cap, so the sweep treats them uniformly.
+//
+// WebDL entries (the private-tracker archive pipeline) live in a separate
+// TorBox listing and are NOT touched.
 //
 // Safe to call concurrently from the periodic loop and from the manual
 // HTTP trigger: cooldown + max-per-run are honoured, and TorBox's
@@ -315,7 +321,12 @@ func (j *QueueJanitor) sweepTorboxActiveDownloads(now time.Time) {
 			if t == nil {
 				continue
 			}
-			if t.Status != types.TorrentStatusDownloading {
+			// Anything that isn't a clean Downloaded counts against TorBox's
+			// active-download cap. Downloading = actively in progress
+			// (paused/queued/checkingDL/etc.); Error = stuck (stalled,
+			// checking-bare, incomplete, expired, uploading-but-not-finished).
+			// Both should be deleted after the grace window.
+			if t.Status != types.TorrentStatusDownloading && t.Status != types.TorrentStatusError {
 				continue
 			}
 			if !t.Added.IsZero() && t.Added.After(graceCutoff) {
@@ -344,8 +355,9 @@ func (j *QueueJanitor) sweepTorboxActiveDownloads(now time.Time) {
 			j.logger.Info().
 				Str("torrent_id", t.Id).
 				Str("name", truncate(t.Name, 80)).
+				Str("status", string(t.Status)).
 				Time("added", t.Added).
-				Msg("TorBox sweep: deleted stuck downloading torrent")
+				Msg("TorBox sweep: deleted stuck torrent")
 		}
 	}
 
@@ -353,7 +365,7 @@ func (j *QueueJanitor) sweepTorboxActiveDownloads(now time.Time) {
 		j.logger.Info().
 			Int("scanned", scanned).
 			Int("deleted", deleted).
-			Msg("TorBox active-download sweep complete")
+			Msg("TorBox stuck-torrent sweep complete")
 	}
 }
 
