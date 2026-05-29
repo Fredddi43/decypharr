@@ -170,9 +170,19 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 	f.failedToReinsert.Store(entry.InfoHash, struct{}{})
 
-	// Mark entry as bad
+	// Mark entry as bad AND transition state to error so the queue janitor's
+	// sweepDecypharrErrors picks it up next pass — that path will ask the
+	// arr to blocklist the release and re-search, which is the only thing
+	// that can rescue this (a different release for the same media may not
+	// trip the same provider-side rejection). Without MarkAsError the entry
+	// just sat in pausedUP with Bad=true forever, the arr kept polling the
+	// import, and no sweep removed it.
 	entry.Bad = true
-	entry.UpdatedAt = time.Now()
+	if lastErr != nil {
+		entry.MarkAsError(fmt.Errorf("all re-insertion attempts failed: %w", lastErr))
+	} else {
+		entry.MarkAsError(fmt.Errorf("all re-insertion attempts failed after %d tries", totalAttempts))
+	}
 	_ = f.manager.AddOrUpdate(entry, func(t *storage.Entry) {
 		f.manager.RefreshEntries(true)
 	})

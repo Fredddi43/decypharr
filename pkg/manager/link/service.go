@@ -30,18 +30,24 @@ type EntryRefresher func(infohash string) (*storage.Entry, error)
 type EntryRepairer func(ctx context.Context, entry *storage.Entry) error
 type EntrySaver func(entry *storage.Entry) error
 
+// ProviderFailedMarker marks a (infohash, provider) pair as permanently
+// failed so the Fixer's cascade skips it on the next repair attempt.
+// Wired to fixer.failedToReinsert by the Manager.
+type ProviderFailedMarker func(infohash, provider string)
+
 // Service handles download link fetching and validation.
 // It uses the account-level cache for storing links and only tracks validation state.
 type Service struct {
-	validated      *xsync.Map[string, error]
-	singleflight   singleflight.Group
-	clients        *xsync.Map[string, debrid.Client]
-	entryRefresher EntryRefresher
-	repairer       EntryRepairer
-	entrySaver     EntrySaver
-	httpClient     *http.Client
-	retries        int
-	logger         zerolog.Logger
+	validated          *xsync.Map[string, error]
+	singleflight       singleflight.Group
+	clients            *xsync.Map[string, debrid.Client]
+	entryRefresher     EntryRefresher
+	repairer           EntryRepairer
+	entrySaver         EntrySaver
+	markProviderFailed ProviderFailedMarker
+	httpClient         *http.Client
+	retries            int
+	logger             zerolog.Logger
 }
 
 // New creates a new LinkService
@@ -50,19 +56,21 @@ func New(
 	entryRefresher EntryRefresher,
 	entryReinsert EntryRepairer,
 	entrySaver EntrySaver,
+	markProviderFailed ProviderFailedMarker,
 	httpClient *http.Client,
 	retries int,
 	logger zerolog.Logger,
 ) *Service {
 	return &Service{
-		validated:      xsync.NewMap[string, error](),
-		clients:        clients,
-		entryRefresher: entryRefresher,
-		repairer:       entryReinsert,
-		entrySaver:     entrySaver,
-		httpClient:     httpClient,
-		retries:        retries,
-		logger:         logger,
+		validated:          xsync.NewMap[string, error](),
+		clients:            clients,
+		entryRefresher:     entryRefresher,
+		repairer:           entryReinsert,
+		entrySaver:         entrySaver,
+		markProviderFailed: markProviderFailed,
+		httpClient:         httpClient,
+		retries:            retries,
+		logger:             logger,
 	}
 }
 
@@ -155,6 +163,41 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 }
 
 func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.Entry, dl types.DownloadLink, attempt int) (types.DownloadLink, error) {
+	// LinkInfringingError: the link is permanently dead AT THIS PROVIDER
+	// (DMCA, IP-blocked, account permission). Re-submitting the same
+	// magnet to the same provider hits the same wall, so before kicking
+	// off the repair cascade, mark this provider as failed-for-this-hash
+	// so Fixer.FixTorrent's attemptOrder skips it and goes straight to
+	// the next configured debrid. If a sibling already has the file
+	// downloaded, ActivatePlacement flips ActiveProvider and reads
+	// immediately work. If no sibling has it, the cascade submits the
+	// magnet to the next debrid and (assuming THAT one doesn't also
+	// DMCA) the new placement takes over.
+	if errors.Is(err, customerror.LinkInfringingError) {
+		if entry.Bad {
+			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
+		}
+		if attempt >= MaxReinsertionAttempt {
+			s.markEntryBad(entry, dl.Filename, attempt, "link_infringing")
+			return emptyDownloadLink, fmt.Errorf("entry %s file %s permanently rejected by all providers after %d attempts", entry.GetFolder(), dl.Filename, attempt)
+		}
+		if s.markProviderFailed != nil && entry.ActiveProvider != "" {
+			s.markProviderFailed(entry.InfoHash, entry.ActiveProvider)
+			s.logger.Warn().
+				Str("infohash", entry.InfoHash).
+				Str("provider", entry.ActiveProvider).
+				Str("filename", dl.Filename).
+				Msg("Provider returned permanent link error; skipping provider on repair cascade")
+		}
+		if err := s.repairer(ctx, entry); err != nil {
+			return emptyDownloadLink, err
+		}
+		if entry.Bad {
+			return emptyDownloadLink, fmt.Errorf("entry %s(%s) still bad after repair, un-repairable", entry.GetFolder(), dl.Link)
+		}
+		return s.fetchAndValidate(ctx, entry, dl.Filename, attempt+1)
+	}
+
 	if errors.Is(err, customerror.HosterUnavailableError) {
 		if entry.Bad {
 			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())

@@ -282,6 +282,18 @@ func (m *Manager) initLinkService() {
 		m.refreshTorrent,
 		m.ReinsertEntry,
 		func(entry *storage.Entry) error { return m.AddOrUpdate(entry, nil) },
+		// markProviderFailed: when the link service gets a permanent
+		// per-link error from a provider (DMCA, IP-blocked, etc.), it
+		// records that provider as failed for this infohash. The Fixer's
+		// cascade then skips this debrid in its attempt order on the
+		// repair pass, so the same magnet doesn't get pointlessly
+		// re-submitted to a provider that will reject it again.
+		func(infohash, provider string) {
+			if m.fixer == nil {
+				return
+			}
+			m.fixer.failedToReinsert.Store(fmt.Sprintf("%s:%s", infohash, provider), struct{}{})
+		},
 		m.streamClient,
 		m.config.Retries,
 		logger.New("link"),

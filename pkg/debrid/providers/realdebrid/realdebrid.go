@@ -819,9 +819,23 @@ func (r *RealDebrid) fetchDownloadLink(account *account.Account, id string, file
 		return emptyLink, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		// RD error codes (https://api.real-debrid.com/) split by recovery
+		// strategy:
+		//   * 19 hoster_temporarily_unavailable, 24 link_temporarily_unavailable
+		//     → transient outage at the hoster, retrying the SAME link later
+		//     usually works. Reported as HosterUnavailableError (Retryable).
+		//   * 9 file_unavailable / permission_denied, 33 ip_address_not_allowed,
+		//     35 infringing_file → permanent per-LINK rejection (DMCA, IP
+		//     restriction, account-level deny). The same magnet re-submitted
+		//     to RD will hit the same wall. We must skip RD for THIS hash
+		//     and try a sibling provider. Reported as LinkInfringingError
+		//     (NOT Retryable).
+		//   * 23, 34, 36 → account-level traffic exhaustion. TrafficExceededError.
 		switch errResp.ErrorCode {
-		case 19, 24, 35:
+		case 19, 24:
 			return emptyLink, customerror.HosterUnavailableError
+		case 9, 33, 35:
+			return emptyLink, customerror.LinkInfringingError
 		case 23, 34, 36:
 			return emptyLink, customerror.TrafficExceededError
 		default:

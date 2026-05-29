@@ -31,3 +31,16 @@ var TooManyActiveDownloadsError = (&Error{
 	err:        errors.New("too many active downloads"),
 	Code:       "too_many_active_downloads",
 }).Retryable() // slot exhaustion is transient — retry after backoff
+
+// LinkInfringingError signals that the link is permanently dead at a
+// specific provider — DMCA takedown, IP-blocked content, premium-only
+// hoster access denied. Distinct from HosterUnavailableError (which is
+// retryable / transient): the same magnet re-submitted to the same
+// provider will hit the same wall, so the repair pipeline must skip
+// THIS provider and try a sibling instead. Not Retryable — callers
+// that see this should not back-off-and-retry the same link.
+var LinkInfringingError = &Error{
+	statusCode: 451,
+	err:        errors.New("link permanently unavailable at this provider"),
+	Code:       "link_infringing",
+}
