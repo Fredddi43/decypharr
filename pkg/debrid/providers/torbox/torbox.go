@@ -3,6 +3,7 @@ package torbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -276,9 +277,26 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 
 	resp, err := tb.doSubmitPostForm("/api/torrents/createtorrent", formData, &data)
 	if err != nil {
+		// Two failure modes both mean "submit quota exhausted, retry later":
+		//   1. WithNonBlockingRateLimit's local Allow() returned false → the
+		//      request was never sent. err == ErrRateLimitExhausted.
+		//   2. The submit client *did* hit TorBox, got 429, retryablehttp ran
+		//      out of attempts → err contains "giving up after N attempt(s)".
+		// Both wrap as RateLimitedError so the manager's submit retry loop
+		// can typed-match and cool down this provider instead of marking
+		// the entry permanently failed.
+		if errors.Is(err, request.ErrRateLimitExhausted) {
+			return nil, customerror.RateLimitedError
+		}
+		if strings.Contains(err.Error(), "giving up after") {
+			return nil, fmt.Errorf("%w: %v", customerror.RateLimitedError, err)
+		}
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, customerror.RateLimitedError
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
 	}

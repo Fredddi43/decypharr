@@ -83,6 +83,44 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 	return nil
 }
 
+// Per-provider submit-rate-limit retry tuning. The TorBox submit endpoint
+// allows ~60 createtorrent calls/hour, so initial backoff of 90s spread
+// across 6 attempts (capped at 30m) covers the full quota-reset window
+// (~2h) without burning the whole hour on one entry.
+const (
+	rateLimitInitialBackoff = 90 * time.Second
+	rateLimitMaxBackoff     = 30 * time.Minute
+	rateLimitMaxAttempts    = 6
+	providerCooldownDur     = 10 * time.Minute
+)
+
+// markProviderSubmitCooldown records a "skip this provider for SubmitMagnet
+// calls until N from now" hint after the provider returned RateLimitedError.
+// Lazily expires — providerSubmitCooldownRemaining cleans up past entries.
+func (m *Manager) markProviderSubmitCooldown(name string, dur time.Duration) {
+	if name == "" || dur <= 0 {
+		return
+	}
+	until := time.Now().Add(dur)
+	m.providerSubmitCooldown.Store(name, until)
+	m.logger.Warn().Str("Provider", name).Dur("Cooldown", dur).Msg("Provider submit rate-limited; cooling down before next attempt")
+}
+
+// providerSubmitCooldownRemaining returns the remaining cooldown for a
+// provider, or 0 if it's free to submit. Self-cleans expired entries.
+func (m *Manager) providerSubmitCooldownRemaining(name string) time.Duration {
+	v, ok := m.providerSubmitCooldown.Load(name)
+	if !ok {
+		return 0
+	}
+	rem := time.Until(v)
+	if rem <= 0 {
+		m.providerSubmitCooldown.Delete(name)
+		return 0
+	}
+	return rem
+}
+
 // submitNewTorrentAsync runs SendToDebrid for a newly-queued entry and
 // transitions the placeholder into either a normal "downloading → pausedUP"
 // flow or a "state=error" terminal state. Always runs in its own goroutine.
@@ -109,12 +147,29 @@ func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRe
 		return
 	}
 
-	// Every configured debrid rejected the magnet. Transition the
-	// placeholder into state=error first so the queue accurately reflects
-	// what happened — the eager-drop path below will remove it for
-	// permanent failures; transient failures stay in state=error and
-	// wait for the janitor's next sweep (which may decide to retry
-	// later) so a transient rate-limit doesn't get a release blocklisted.
+	// Every configured debrid rejected the magnet because their submit
+	// quota is exhausted. Don't blocklist — schedule a delayed retry so
+	// the entry stays in the queue, waiting for the quota window to
+	// reset. The arr keeps seeing it as "downloading" in qBit polls and
+	// won't escalate to Failed.
+	if errors.Is(err, customerror.RateLimitedError) {
+		m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("All providers rate-limited — entry stays queued, scheduling retry")
+		entry.State = storage.EntryStateDownloading
+		entry.IsDownloading = false
+		if !hasTag(entry.Tags, "submission-rate-limited") {
+			entry.Tags = append(entry.Tags, "submission-rate-limited")
+		}
+		_ = m.queue.Update(entry)
+		go m.retryRateLimitedSubmit(ctx, importReq, entry, 1)
+		return
+	}
+
+	// Permanent / non-rate-limit failure. Transition the placeholder into
+	// state=error first so the queue accurately reflects what happened —
+	// the eager-drop path below will remove it for permanent failures;
+	// transient failures stay in state=error and wait for the janitor's
+	// next sweep (which may decide to retry later) so a transient
+	// rate-limit doesn't get a release blocklisted.
 	m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("All debrids rejected the magnet — entry transitioning to state=error so the arr can blocklist + re-search")
 	entry.MarkAsError(err)
 	entry.Status = debridTypes.TorrentStatusError
@@ -146,6 +201,94 @@ func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRe
 				Msg("Eagerly dropped permanently-rejected Decypharr entry")
 		}
 	}
+}
+
+func hasTag(tags []string, want string) bool {
+	for _, t := range tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// retryRateLimitedSubmit sleeps for an exponential-backoff window then
+// re-submits a previously-rate-limited entry. Recurses on continued
+// rate-limit responses up to rateLimitMaxAttempts; falls through to the
+// regular error-handling path on a non-rate-limit error; gives up and
+// MarkAsError after the attempt cap so the queue eventually drains.
+//
+// At-most-one-in-flight per InfoHash via pendingRateLimitRetries so a
+// concurrent qBit-compat /add for the same hash can't fork the chain.
+func (m *Manager) retryRateLimitedSubmit(ctx context.Context, importReq *ImportRequest, entry *storage.Entry, attempt int) {
+	if _, loaded := m.pendingRateLimitRetries.LoadOrStore(entry.InfoHash, struct{}{}); loaded {
+		return
+	}
+	defer m.pendingRateLimitRetries.Delete(entry.InfoHash)
+
+	backoff := rateLimitInitialBackoff * (1 << (attempt - 1))
+	if backoff > rateLimitMaxBackoff {
+		backoff = rateLimitMaxBackoff
+	}
+	m.logger.Info().Str("hash", entry.InfoHash).Str("name", entry.Name).Int("attempt", attempt).Dur("after", backoff).Msg("Rate-limit submit retry scheduled")
+
+	select {
+	case <-time.After(backoff):
+	case <-ctx.Done():
+		return
+	}
+
+	debridTorrent, err := m.SendToDebrid(ctx, importReq)
+	if err == nil {
+		entry.DownloadUncached = debridTorrent.DownloadUncached
+		entry.Tags = removeTag(entry.Tags, "submission-rate-limited")
+		_ = m.queue.Update(entry)
+		m.processNewTorrent(entry, debridTorrent)
+		return
+	}
+
+	if errors.Is(err, customerror.RateLimitedError) {
+		if attempt >= rateLimitMaxAttempts {
+			m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Int("attempts", attempt).Msg("Rate-limit retry attempts exhausted — marking entry as error")
+			entry.MarkAsError(fmt.Errorf("rate-limit retries exhausted after %d attempts: %w", attempt, err))
+			entry.Tags = append(entry.Tags, "submission-rate-limit-exhausted")
+			_ = m.queue.Update(entry)
+			return
+		}
+		// Spawn the next attempt outside the in-flight guard so the
+		// defer can release it before the recursion stores it again.
+		go m.retryRateLimitedSubmit(ctx, importReq, entry, attempt+1)
+		return
+	}
+
+	// A different (non-rate-limit) failure surfaced this attempt. Fall
+	// through to the standard error path so permanent rejections get
+	// blocklisted as before.
+	var customErr *customerror.Error
+	if errors.As(err, &customErr) && customErr.Code == "too_many_active_downloads" {
+		entry.State = storage.EntryStateDownloading
+		entry.IsDownloading = false
+		_ = m.queue.Update(entry)
+		return
+	}
+	m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("Rate-limited retry surfaced a non-rate-limit error — proceeding to standard error path")
+	entry.MarkAsError(err)
+	entry.Tags = append(entry.Tags, "submission-rejected")
+	_ = m.queue.Update(entry)
+	if m.queueJanitor != nil && !isTransientErrorReason(err.Error()) {
+		m.queueJanitor.dropPermanentlyRejected(entry)
+	}
+}
+
+func removeTag(tags []string, drop string) []string {
+	out := tags[:0]
+	for _, t := range tags {
+		if t == drop {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 func (m *Manager) processQueuedEntries() {
@@ -418,6 +561,16 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 	errs := make([]error, 0, len(clients))
 
 	for _, db := range clients {
+		// Honour an active submit-rate-limit cooldown — calling SubmitMagnet
+		// against a quota-exhausted provider just burns one of its retries
+		// and stalls the loop. Emit the cooldown reason as a rate-limit
+		// error so the joined result preserves the typed signal for the
+		// retry path upstream.
+		if rem := m.providerSubmitCooldownRemaining(db.Config().Name); rem > 0 {
+			errs = append(errs, fmt.Errorf("%s: %w (cooldown %s)", db.Config().Name, customerror.RateLimitedError, rem.Truncate(time.Second)))
+			continue
+		}
+
 		overrideDownloadUncached := false
 
 		if importRequest.DownloadUncached != nil {
@@ -445,6 +598,12 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			reason := err
 			if reason == nil {
 				reason = fmt.Errorf("no torrent id returned")
+			}
+			// Rate-limit responses get a per-provider cooldown so the
+			// upstream retry path (or a sibling magnet right behind this
+			// one) doesn't immediately re-hit the same exhausted quota.
+			if errors.Is(reason, customerror.RateLimitedError) {
+				m.markProviderSubmitCooldown(db.Config().Name, providerCooldownDur)
 			}
 			_logger.Warn().Err(reason).Str("Provider", db.Config().Name).Str("Hash", debridTorrent.InfoHash).Msg("SubmitMagnet failed; trying next debrid")
 			errs = append(errs, fmt.Errorf("%s: %w", db.Config().Name, reason))

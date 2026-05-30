@@ -32,6 +32,17 @@ var TooManyActiveDownloadsError = (&Error{
 	Code:       "too_many_active_downloads",
 }).Retryable() // slot exhaustion is transient — retry after backoff
 
+// RateLimitedError signals the provider rejected the request because the
+// operator's submit quota at that provider is currently exhausted. Distinct
+// from TooManyActiveDownloadsError, which signals slot exhaustion. Both are
+// transient — the submit pipeline should cooldown the offending provider
+// and retry the magnet after a delay rather than blocklisting the release.
+var RateLimitedError = (&Error{
+	statusCode: 429,
+	err:        errors.New("provider rate limit exhausted"),
+	Code:       "rate_limited",
+}).Retryable()
+
 // LinkInfringingError signals that the link is permanently dead at a
 // specific provider — DMCA takedown, IP-blocked content, premium-only
 // hoster access denied. Distinct from HosterUnavailableError (which is

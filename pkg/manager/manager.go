@@ -92,6 +92,18 @@ type Manager struct {
 	// re-fires before the previous pass has updated the queue row.
 	processingEntries *xsync.Map[string, struct{}]
 
+	// providerSubmitCooldown holds a per-provider "do not attempt submission
+	// before this time" marker, set when SubmitMagnet returns RateLimitedError.
+	// SendToDebrid consults this before calling SubmitMagnet so a saturated
+	// provider's quota window is honoured instead of repeatedly hammering
+	// the same 429. Cleared lazily when the time has passed.
+	providerSubmitCooldown *xsync.Map[string, time.Time]
+
+	// pendingRateLimitRetries tracks hashes that have an in-flight delayed
+	// retry goroutine so a duplicate qBit-compat /add (or any other re-entry
+	// path) doesn't spawn a second retry chain for the same magnet.
+	pendingRateLimitRetries *xsync.Map[string, struct{}]
+
 	// NZB processing worker pool (unbounded queue)
 	nzbQueue      *nzbJobQueue
 	nzbWorkerStop chan struct{} // Signal to stop workers
@@ -165,6 +177,8 @@ func New() *Manager {
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
 		syncMissCounters:       xsync.NewMap[string, int](),
+		providerSubmitCooldown: xsync.NewMap[string, time.Time](),
+		pendingRateLimitRetries: xsync.NewMap[string, struct{}](),
 	}
 
 	instance.init()

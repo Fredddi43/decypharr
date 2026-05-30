@@ -983,29 +983,33 @@ func pickRecordTime(rec arrQueueRecord) time.Time {
 // patterns are intentionally narrow — anything we don't explicitly
 // recognise as transient gets treated as permanent (current
 // blocklist+research behaviour).
-// isTransientErrorReason returns true only when every meaningful line of
-// reason matches a known-transient pattern. Multi-provider errors arrive
-// concatenated like
+//
+// Multi-provider errors arrive concatenated like
 //   "failed to process torrent: RealDebrid: ... Status: 451\nTorBox: rate limit exhausted"
-// and a single permanent line (Status: 451) must poison the whole result
-// — otherwise a permanently-DMCAed release looks transient just because
-// one of the fallback providers happened to be rate-limited.
+// and we treat the whole thing as transient if ANY line is transient.
+// Rationale: the providers are independent — RD permanently rejecting a
+// release with 451 does not affect TorBox's ability to serve it once
+// TorBox's rate-limit window clears. Earlier semantics required EVERY
+// line to be transient, but that caused mass-drops whenever the
+// fallback provider returned a permanent error while the primary was
+// rate-limited. The submit retry path (retryRateLimitedSubmit) handles
+// the actual rescheduling; this function's job is just to prevent the
+// janitor's blocklist sweep from eating an entry that has a viable
+// retry path on at least one provider.
 func isTransientErrorReason(reason string) bool {
 	if reason == "" {
 		return false
 	}
-	anyMeaningful := false
 	for _, ln := range strings.Split(reason, "\n") {
 		ln = strings.TrimSpace(strings.ToLower(ln))
 		if ln == "" {
 			continue
 		}
-		anyMeaningful = true
-		if !lineIsTransient(ln) {
-			return false
+		if lineIsTransient(ln) {
+			return true
 		}
 	}
-	return anyMeaningful
+	return false
 }
 
 func lineIsTransient(line string) bool {
