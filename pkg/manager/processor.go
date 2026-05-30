@@ -248,6 +248,39 @@ func hasTag(tags []string, want string) bool {
 	return false
 }
 
+// hasHealthyProcessedSibling reports whether a processed (non-queued) entry
+// already exists for the given infohash with a working placement. This is the
+// "the orphan_recovery flagged me falsely" signal: when an external
+// re-submission tries to fix a file that's actually fine, the queue entry it
+// creates is a shadow of a still-healthy processed entry. The retry chain
+// uses this to short-circuit redundant retries (which would otherwise burn
+// debrid rate-limit quota and risk overwriting the healthy placement once
+// the submit eventually goes through).
+//
+// "Healthy" = entry has an ActiveProvider AND that provider's ProviderEntry
+// has at least one file with a non-empty Id, i.e. enough state to fetch a
+// download URL. We deliberately do NOT make a live network call here — that
+// would defeat the rate-limit-protection purpose of the guard.
+func (m *Manager) hasHealthyProcessedSibling(infohash string) bool {
+	if infohash == "" {
+		return false
+	}
+	processed, err := m.storage.Get(infohash)
+	if err != nil || processed == nil {
+		return false
+	}
+	active := processed.GetActiveProvider()
+	if active == nil {
+		return false
+	}
+	for _, pf := range active.Files {
+		if pf.Id != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // retryRateLimitedSubmit sleeps for an exponential-backoff window then
 // re-submits a previously-rate-limited entry. Recurses on continued
 // rate-limit responses up to rateLimitMaxAttempts; falls through to the
@@ -262,6 +295,22 @@ func (m *Manager) retryRateLimitedSubmit(ctx context.Context, importReq *ImportR
 	}
 	defer m.pendingRateLimitRetries.Delete(entry.InfoHash)
 
+	// Healthy-sibling short-circuit. If a processed entry for this infohash
+	// already has a working placement, the queue entry is a false-positive
+	// shadow (created by an external re-submission against an actually-fine
+	// file — e.g. the orphan_recovery script). Drop the queue record without
+	// touching the symlink or dfs cache and skip the retry.
+	if m.hasHealthyProcessedSibling(entry.InfoHash) {
+		m.logger.Info().
+			Str("hash", entry.InfoHash).
+			Str("name", entry.Name).
+			Msg("Skipping rate-limit retry: processed sibling already has healthy placement")
+		if err := m.queue.RemoveFromQueueOnly(entry.InfoHash); err != nil {
+			m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Failed to remove redundant queue entry")
+		}
+		return
+	}
+
 	backoff := rateLimitInitialBackoff * (1 << (attempt - 1))
 	if backoff > rateLimitMaxBackoff {
 		backoff = rateLimitMaxBackoff
@@ -271,6 +320,21 @@ func (m *Manager) retryRateLimitedSubmit(ctx context.Context, importReq *ImportR
 	select {
 	case <-time.After(backoff):
 	case <-ctx.Done():
+		return
+	}
+
+	// Re-check after the backoff window — a parallel path (sync, manual fix,
+	// even a concurrent retry chain that just succeeded) may have completed
+	// the placement while we slept. Don't burn another submit slot if so.
+	if m.hasHealthyProcessedSibling(entry.InfoHash) {
+		m.logger.Info().
+			Str("hash", entry.InfoHash).
+			Str("name", entry.Name).
+			Int("attempt", attempt).
+			Msg("Skipping rate-limit retry: processed sibling acquired healthy placement during backoff")
+		if err := m.queue.RemoveFromQueueOnly(entry.InfoHash); err != nil {
+			m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Failed to remove redundant queue entry")
+		}
 		return
 	}
 
@@ -409,6 +473,23 @@ func (m *Manager) resumeRateLimitedRetries(ctx context.Context) {
 		// If the entry now has a viable placement, it's already recovered —
 		// nothing to do.
 		if entry.GetActiveProvider() != nil {
+			continue
+		}
+		// Healthy-sibling guard: the queue entry's hash matches a processed
+		// entry that DOES have a working placement. The queue entry is a
+		// false-positive shadow (typical cause: an external re-submission
+		// targeted an actually-fine file). Drop it from the queue without
+		// any file/cache cleanup — the working processed entry stays
+		// untouched and reads keep serving from its placement.
+		if m.hasHealthyProcessedSibling(entry.InfoHash) {
+			m.logger.Info().
+				Str("hash", entry.InfoHash).
+				Str("name", entry.Name).
+				Msg("Resume-rate-limited: dropping redundant queue entry — processed sibling has healthy placement")
+			if err := m.queue.RemoveFromQueueOnly(entry.InfoHash); err != nil {
+				m.logger.Warn().Err(err).Str("hash", entry.InfoHash).Msg("Failed to remove redundant queue entry")
+			}
+			resumed++
 			continue
 		}
 		if entry.Magnet == "" {

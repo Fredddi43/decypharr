@@ -190,6 +190,15 @@ func (q *Queue) Delete(infohash string, cleanup func(t *storage.Entry) error) er
 	return q.storage.DeleteQueued(infohash, q.wrapCleanupWithFileDelete(cleanup))
 }
 
+// RemoveFromQueueOnly removes a queue record WITHOUT touching the arr's library
+// symlink or the dfs cache. Use ONLY when the queue entry is a redundant
+// shadow of a healthy processed entry (same infohash, working placement) —
+// the normal Delete path would wipe the working entry's cache too, since
+// cache keys live under entry-folder names that collide across the two stores.
+func (q *Queue) RemoveFromQueueOnly(infohash string) error {
+	return q.storage.DeleteQueued(infohash, nil)
+}
+
 func (q *Queue) DeleteWhere(category string, protocol config.Protocol, state storage.TorrentState, hashes []string, cleanup func(t *storage.Entry) error) error {
 	return q.storage.DeleteWhereQueued(q.ListFilterFunc(category, protocol, state, hashes), q.wrapCleanupWithFileDelete(cleanup))
 }
