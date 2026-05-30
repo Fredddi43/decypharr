@@ -100,8 +100,16 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	// Set attributes
 	d.setEntryOut(info, out)
 
-	// Create/get inode - NewInode handles deduplication
-	return d.NewInode(ctx, node, fs.StableAttr{Mode: out.Attr.Mode}), 0
+	// Derive inode from the entry's stable path (parent/child) so it survives
+	// container restarts. Readdir already hashes the same string at line 180;
+	// without this Lookup, go-fuse would auto-allocate a fresh inode per
+	// mount and the two sites would disagree. Downstream consumers (Plex's
+	// library scanner in particular) treat inode change as "file replaced"
+	// and re-import every entry whenever decypharr restarts.
+	return d.NewInode(ctx, node, fs.StableAttr{
+		Mode: out.Attr.Mode,
+		Ino:  hashPath(d.name + "/" + name),
+	}), 0
 }
 
 // lookupChild looks up a child by name using O(1) lookups where possible
