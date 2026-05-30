@@ -392,17 +392,39 @@ func (e *Entry) HasProvider(provider string) bool {
 	return exists
 }
 
-// SwitchToNextProvider switches to the next completed providerEntry if available
+// SwitchToNextProvider switches to the next completed providerEntry if
+// available. If no sibling has Status == Downloaded but the current
+// ActiveProvider is no longer present in Providers (i.e. RemoveProvider
+// just purged it), the entry is orphaned — FUSE reads through it would
+// EIO because GetActiveProvider() returns nil. In that case we transition
+// the entry to state=error with a non-transient reason so the queue
+// janitor's sweepDecypharrErrors picks it up next pass and drives the
+// arr-side blocklist + research path, instead of leaving the user with a
+// phantom symlink that stat()s fine but never reads.
 func (e *Entry) SwitchToNextProvider() {
-	if e.Providers == nil {
-		return
-	}
-	for _, providerEntry := range e.Providers {
-		if providerEntry.Status == debridTypes.TorrentStatusDownloaded {
-			_ = e.ActivatePlacement(providerEntry.Provider)
-			return
+	if e.Providers != nil {
+		for _, providerEntry := range e.Providers {
+			if providerEntry.Status == debridTypes.TorrentStatusDownloaded {
+				_ = e.ActivatePlacement(providerEntry.Provider)
+				return
+			}
 		}
 	}
+
+	// No viable sibling. If our ActiveProvider was just removed from the
+	// Providers map, we're orphaned — drive into state=error so the
+	// janitor can blocklist+research via the arr. The error reason is
+	// intentionally chosen to NOT match isTransientErrorReason patterns
+	// (no "rate limit" / "timeout" / "status: 4xx-5xx" substrings).
+	if e.ActiveProvider == "" {
+		return
+	}
+	if _, stillThere := e.Providers[e.ActiveProvider]; stillThere {
+		return
+	}
+	removed := e.ActiveProvider
+	e.ActiveProvider = ""
+	e.MarkAsError(fmt.Errorf("placement orphaned: %q dropped and no sibling has the file", removed))
 }
 
 // MarkAsCompleted marks the torrent as completed
