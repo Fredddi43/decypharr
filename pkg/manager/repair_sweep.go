@@ -217,6 +217,13 @@ func (r *Repair) probeCandidates(ctx context.Context, run *storage.RepairRun, ca
 // still exists. We have no item.Files to walk; we just stat each
 // contentMap file's symlink path and mark broken when the resolved
 // target is missing.
+//
+// No sibling-check applies here: an orphan by definition has no
+// storage entry, and arr.ContentFile doesn't carry an InfoHash we
+// could use to find a same-hash sibling. The two-pass confirmation
+// gate + dry-run default in the surrounding sweep covers the rare
+// edge case where a different release name in storage shares the same
+// underlying file.
 func (r *Repair) orphanProbe(c *candidate) []fileResult {
 	results := make([]fileResult, 0, len(c.contentMap))
 	for _, f := range c.contentMap {
@@ -468,6 +475,28 @@ func (r *Repair) overlaySymlinkTargetChecks(results []fileResult, c *candidate) 
 	for _, f := range c.contentMap {
 		broken, reason := checkArrSymlinkBroken(f.Path)
 		if !broken {
+			continue
+		}
+		// Sibling guard: derive the infohash from the storage item's File
+		// entry (arr.ContentFile doesn't carry one), then check whether
+		// another processed entry already serves that hash with a healthy
+		// placement. If so, the probe likely hit a shadow path (e.g. a
+		// duplicate queue entry from a re-submission against an actually
+		// fine file). Don't promote a working entry to broken just because
+		// an alias symlink resolves elsewhere — same false-positive class
+		// the orphan_recovery script demonstrated.
+		var infoHash string
+		if c.item != nil && c.item.Files != nil {
+			if sf, ok := c.item.Files[f.Name]; ok && sf != nil {
+				infoHash = sf.InfoHash
+			}
+		}
+		if infoHash != "" && r.manager.hasHealthyProcessedSibling(infoHash) {
+			r.logger.Debug().
+				Str("infohash", infoHash).
+				Str("name", f.Name).
+				Str("probe_reason", reason).
+				Msg("overlaySymlinkTargetChecks: suppressing broken verdict — processed sibling has healthy placement")
 			continue
 		}
 		// Find a matching result (by ContentFile.Name) and override; if

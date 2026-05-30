@@ -1,6 +1,11 @@
 package torbox
 
-import "time"
+import (
+	"fmt"
+	"time"
+
+	json "github.com/bytedance/sonic"
+)
 
 type APIResponse[T any] struct {
 	Success bool   `json:"success"`
@@ -71,6 +76,49 @@ type torboxInfo struct {
 }
 
 type InfoResponse APIResponse[torboxInfo]
+
+// UnmarshalJSON accepts both response shapes that TorBox's /api/torrents/mylist
+// endpoint returns. The `?id=<torrentId>` form documented as singular (data is
+// an object) intermittently comes back with data as a one-element array
+// instead — we saw 26 occurrences in a two-hour window during the 2026-05-30
+// retry-chain post-submit verification storm, each abandoning a successful
+// submission as if it had failed. Mirror the dual-format pattern already in
+// realdebrid/types.go (AvailabilityResponse, Hoster) so we can survive
+// whichever shape lands.
+func (r *InfoResponse) UnmarshalJSON(data []byte) error {
+	// Use a shadow type so attempting the singular path doesn't recurse.
+	type shadow APIResponse[torboxInfo]
+
+	// First: try the singular {data:{object}} shape that the API mostly returns.
+	var singular shadow
+	if err := json.Unmarshal(data, &singular); err == nil {
+		*r = InfoResponse(singular)
+		return nil
+	}
+
+	// Fallback: the API sometimes returns {data:[object,...]} for the same
+	// endpoint. Parse into the array variant and lift the first element.
+	type arrayShape struct {
+		Success bool          `json:"success"`
+		Error   any           `json:"error"`
+		Detail  string        `json:"detail"`
+		Data    []torboxInfo  `json:"data"`
+	}
+	var arr arrayShape
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return fmt.Errorf("torbox InfoResponse: data is neither object nor array: %w", err)
+	}
+	r.Success = arr.Success
+	r.Error = arr.Error
+	r.Detail = arr.Detail
+	if len(arr.Data) == 0 {
+		r.Data = nil
+		return nil
+	}
+	first := arr.Data[0]
+	r.Data = &first
+	return nil
+}
 
 type DownloadLinksResponse APIResponse[string]
 
