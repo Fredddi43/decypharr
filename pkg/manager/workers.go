@@ -17,6 +17,7 @@ func (m *Manager) runInitialCalls(ctx context.Context) {
 	go m.trackAvailableSlots(ctx)
 	go m.processQueuedEntries()
 	go m.syncAccounts()
+	go m.resumeRateLimitedRetries(ctx)
 }
 
 func (m *Manager) syncAccounts() {

@@ -581,7 +581,19 @@ func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {
 	for {
 		torrents, err := tb.getTorrents(offset)
 		if err != nil {
-			break
+			// PARTIAL FETCH: a rate-limited or transient-failed page
+			// midway through pagination used to silently return the
+			// already-collected slice with err=nil, and the sync loop
+			// treated that incomplete list as authoritative — every
+			// torrent that hadn't yet shown up was counted as a "miss"
+			// and three of those passes in a row purged the placement.
+			// Mass false-deletes followed across the library. RealDebrid's
+			// equivalent function returns (nil, err) on partial fetch
+			// (realdebrid.go:966-968); match that contract so the caller
+			// in pkg/manager/torrent.go:78-82 bails BEFORE any miss
+			// counters increment, and the next sync pass retries from
+			// scratch.
+			return nil, fmt.Errorf("torbox GetTorrents: partial fetch at offset=%d (%d collected): %w", offset, len(allTorrents), err)
 		}
 		if len(torrents) == 0 {
 			break

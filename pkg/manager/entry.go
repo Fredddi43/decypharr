@@ -350,18 +350,44 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 		return nil, nil
 	}
 
+	// Resolve the parent Entry's ActiveProvider for each file so the browse
+	// API returns the correct active_debrid at file level — without this we
+	// emit active_debrid="" on every file even when the placement is healthy
+	// at the entry level. Downstream that surfaces as orphan-class behaviour
+	// (clients believe there's no provider, give up on reads, report EIO).
+	//
+	// EntryItem can carry files from multiple distinct Entries with the same
+	// folder name, so we cache per-infohash to avoid redundant lookups.
+	providerCache := make(map[string]string, 1)
+	resolveProvider := func(infohash string) string {
+		if infohash == "" {
+			return ""
+		}
+		if v, ok := providerCache[infohash]; ok {
+			return v
+		}
+		v := ""
+		if e, err := m.storage.Get(infohash); err == nil && e != nil {
+			v = e.ActiveProvider
+		}
+		providerCache[infohash] = v
+		return v
+	}
+
 	// Convert files to FileInfo
 	infos := make([]FileInfo, 0, len(entry.Files))
 	size := int64(0)
 	for _, file := range entry.Files {
 		infos = append(infos, FileInfo{
-			name:      file.Name,
-			size:      file.Size,
-			modTime:   file.AddedOn,
-			isDir:     false,
-			parent:    entry.Name,
-			canDelete: true,
-			byteRange: file.ByteRange,
+			name:         file.Name,
+			size:         file.Size,
+			modTime:      file.AddedOn,
+			isDir:        false,
+			parent:       entry.Name,
+			canDelete:    true,
+			byteRange:    file.ByteRange,
+			infohash:     file.InfoHash,
+			activeDebrid: resolveProvider(file.InfoHash),
 		})
 		size += file.Size
 	}
@@ -369,11 +395,22 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 		return nil, nil
 	}
 
+	// currentDir reflects the folder — use the most-common (here: any non-empty)
+	// active provider across the file set so single-torrent folders show the
+	// right debrid and multi-torrent collisions at least show one valid value.
+	folderProvider := ""
+	for _, fi := range infos {
+		if fi.activeDebrid != "" {
+			folderProvider = fi.activeDebrid
+			break
+		}
+	}
 	currentDir := &FileInfo{
-		name:    entry.Name,
-		size:    size,
-		modTime: infos[0].modTime,
-		isDir:   true,
+		name:         entry.Name,
+		size:         size,
+		modTime:      infos[0].modTime,
+		isDir:        true,
+		activeDebrid: folderProvider,
 	}
 	return currentDir, infos
 }

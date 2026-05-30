@@ -291,6 +291,95 @@ func removeTag(tags []string, drop string) []string {
 	return out
 }
 
+// resumeRateLimitedRetries restarts the in-memory retry chain for any Entry
+// that was waiting on a submission-rate-limited backoff when the previous
+// process died. Without this, a container restart strands every such entry
+// in state=Downloading with no placement and no goroutine watching them —
+// the user has to manually re-submit each magnet to get things moving again.
+//
+// Reconstructs ImportRequest from the persisted Entry fields (Magnet,
+// Category → Arr, Action, DownloadFolder…), and feeds into the same
+// retryRateLimitedSubmit chain a fresh submission would use. The
+// pendingRateLimitRetries guard inside that function prevents double-firing
+// if the periodic processQueuedEntries sweep happens to also touch this hash.
+func (m *Manager) resumeRateLimitedRetries(ctx context.Context) {
+	// Wait briefly so the clients map + arr storage are fully initialized
+	// (these are populated during manager.init / runInitialCalls fan-out).
+	select {
+	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+
+	stranded := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", true)
+	resumed := 0
+	for _, entry := range stranded {
+		if !entry.IsTorrent() {
+			continue
+		}
+		if !hasTag(entry.Tags, "submission-rate-limited") {
+			continue
+		}
+		// IsDownloading is a "currently in flight" signal — skip if a fresh
+		// submission is already running for this hash (rare but possible
+		// during the 5s grace above).
+		if entry.IsDownloading {
+			continue
+		}
+		// If the entry now has a viable placement, it's already recovered —
+		// nothing to do.
+		if entry.GetActiveProvider() != nil {
+			continue
+		}
+		if entry.Magnet == "" {
+			m.logger.Warn().Str("hash", entry.InfoHash).Msg("resume-rate-limited: skipping entry with empty magnet")
+			continue
+		}
+
+		magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
+		if err != nil {
+			magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
+		}
+		if magnet == nil || magnet.Link == "" {
+			m.logger.Warn().Str("hash", entry.InfoHash).Msg("resume-rate-limited: failed to reconstruct magnet")
+			continue
+		}
+
+		arrInst := m.arr.GetOrCreate(entry.Category)
+		downloadFolder := filepath.Dir(entry.SavePath)
+		if downloadFolder == "" || downloadFolder == "." {
+			downloadFolder = m.config.QBitTorrent.DownloadFolder
+		}
+
+		var downloadUncached *bool
+		if entry.DownloadUncached {
+			v := true
+			downloadUncached = &v
+		}
+
+		importReq := &ImportRequest{
+			Id:               entry.InfoHash, // doesn't need to be globally unique for this internal restart
+			DownloadFolder:   downloadFolder,
+			SelectedDebrid:   entry.ActiveProvider, // may be empty — SendToDebrid will use config order
+			Magnet:           magnet,
+			Arr:              arrInst,
+			Action:           entry.Action,
+			DownloadUncached: downloadUncached,
+			CallBackUrl:      entry.CallbackURL,
+			SkipMultiSeason:  entry.SkipMultiSeason,
+			Type:             ImportTypeAPI,
+		}
+
+		m.logger.Info().Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("Resuming rate-limited submit retry after restart")
+		go m.retryRateLimitedSubmit(ctx, importReq, entry, 1)
+		resumed++
+	}
+
+	if resumed > 0 {
+		m.logger.Info().Int("resumed", resumed).Msg("Rate-limited submit retries restarted from persisted state")
+	}
+}
+
 func (m *Manager) processQueuedEntries() {
 	queueEntries := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", true)
 	if len(queueEntries) == 0 {
