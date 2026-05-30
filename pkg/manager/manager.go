@@ -63,6 +63,15 @@ type Manager struct {
 	// count. Entries reset to 0 the first sync pass they're seen again.
 	syncMissCounters *xsync.Map[string, int]
 
+	// syncPartialFetches tracks consecutive partial-fetch failures per
+	// provider (TorBox GetTorrents pagination failing mid-loop, DebridLink
+	// the same, etc). A single partial pass is a transient. Five in a row
+	// signals a sustained backend problem (provider down, account locked)
+	// that an operator should see — we WARN-log with the counter so it
+	// stops being invisible in the noise. Key: provider name; value:
+	// consecutive partial count. Reset to 0 on a successful pass.
+	syncPartialFetches *xsync.Map[string, int]
+
 	// repair
 	fixer *Fixer
 	ctx   context.Context
@@ -177,6 +186,7 @@ func New() *Manager {
 		activeStreams:          xsync.NewMap[string, *ActiveStream](),
 		processingEntries:      xsync.NewMap[string, struct{}](),
 		syncMissCounters:       xsync.NewMap[string, int](),
+		syncPartialFetches:     xsync.NewMap[string, int](),
 		providerSubmitCooldown: xsync.NewMap[string, time.Time](),
 		pendingRateLimitRetries: xsync.NewMap[string, struct{}](),
 	}
@@ -635,6 +645,14 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 
 	if err := m.storage.Delete(infohash); err != nil {
 		return err
+	}
+	// Purge dfs-cache state so abandoned cache directories don't pile up
+	// for entries that no longer exist. Mirrors the Queue.wrapCleanupWithFileDelete
+	// hook for the qBit-compat DELETE path.
+	if m.mountManager != nil {
+		if folder := torr.GetFolder(); folder != "" {
+			m.mountManager.ClearEntry(folder)
+		}
 	}
 	// Refresh entry cache
 	m.RefreshEntries(true)

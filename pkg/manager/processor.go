@@ -96,18 +96,29 @@ const (
 
 // markProviderSubmitCooldown records a "skip this provider for SubmitMagnet
 // calls until N from now" hint after the provider returned RateLimitedError.
-// Lazily expires — providerSubmitCooldownRemaining cleans up past entries.
+// Persisted to disk so a restart immediately after a 429 doesn't reset our
+// learned state and burn a quota slot. Lazily expires —
+// providerSubmitCooldownRemaining cleans up past entries.
 func (m *Manager) markProviderSubmitCooldown(name string, dur time.Duration) {
 	if name == "" || dur <= 0 {
 		return
 	}
 	until := time.Now().Add(dur)
 	m.providerSubmitCooldown.Store(name, until)
+	// Persist. Failures here aren't fatal — the in-memory state still
+	// guards the current process; persistence only matters across restart.
+	if err := m.storage.SaveProviderCooldown(&storage.ProviderCooldown{
+		Provider: name,
+		Until:    until,
+	}); err != nil {
+		m.logger.Warn().Err(err).Str("provider", name).Msg("failed to persist provider cooldown")
+	}
 	m.logger.Warn().Str("Provider", name).Dur("Cooldown", dur).Msg("Provider submit rate-limited; cooling down before next attempt")
 }
 
 // providerSubmitCooldownRemaining returns the remaining cooldown for a
-// provider, or 0 if it's free to submit. Self-cleans expired entries.
+// provider, or 0 if it's free to submit. Self-cleans expired entries
+// from both the in-memory map and the persistent store.
 func (m *Manager) providerSubmitCooldownRemaining(name string) time.Duration {
 	v, ok := m.providerSubmitCooldown.Load(name)
 	if !ok {
@@ -116,9 +127,34 @@ func (m *Manager) providerSubmitCooldownRemaining(name string) time.Duration {
 	rem := time.Until(v)
 	if rem <= 0 {
 		m.providerSubmitCooldown.Delete(name)
+		_ = m.storage.DeleteProviderCooldown(name) // best-effort
 		return 0
 	}
 	return rem
+}
+
+// restoreProviderSubmitCooldowns loads any persisted cooldowns into the
+// in-memory map at startup. Expired entries are dropped from the store
+// during this walk so they don't leak forever on the disk.
+func (m *Manager) restoreProviderSubmitCooldowns() {
+	cooldowns, err := m.storage.LoadProviderCooldowns()
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("failed to load persisted provider cooldowns")
+		return
+	}
+	now := time.Now()
+	restored := 0
+	for _, c := range cooldowns {
+		if c.Until.Before(now) {
+			_ = m.storage.DeleteProviderCooldown(c.Provider)
+			continue
+		}
+		m.providerSubmitCooldown.Store(c.Provider, c.Until)
+		restored++
+	}
+	if restored > 0 {
+		m.logger.Info().Int("restored", restored).Msg("Restored persisted provider cooldowns from previous session")
+	}
 }
 
 // submitNewTorrentAsync runs SendToDebrid for a newly-queued entry and
@@ -291,6 +327,50 @@ func removeTag(tags []string, drop string) []string {
 	return out
 }
 
+// reconstructImportRequestFromEntry builds an ImportRequest from a persisted
+// Entry's fields. Used by resume-after-restart AND the Fixer's deferred-
+// retry path so they share one source of truth for how to revive a stalled
+// submission. Returns nil if essential state is missing (no magnet, no
+// way to construct one) — caller should log + skip.
+func (m *Manager) reconstructImportRequestFromEntry(entry *storage.Entry) *ImportRequest {
+	if entry == nil || entry.Magnet == "" {
+		return nil
+	}
+	magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
+	if err != nil {
+		magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
+	}
+	if magnet == nil || magnet.Link == "" {
+		m.logger.Warn().Str("hash", entry.InfoHash).Msg("reconstruct-import: failed to derive magnet")
+		return nil
+	}
+
+	arrInst := m.arr.GetOrCreate(entry.Category)
+	downloadFolder := filepath.Dir(entry.SavePath)
+	if downloadFolder == "" || downloadFolder == "." {
+		downloadFolder = m.config.QBitTorrent.DownloadFolder
+	}
+
+	var downloadUncached *bool
+	if entry.DownloadUncached {
+		v := true
+		downloadUncached = &v
+	}
+
+	return &ImportRequest{
+		Id:               entry.InfoHash,
+		DownloadFolder:   downloadFolder,
+		SelectedDebrid:   entry.ActiveProvider,
+		Magnet:           magnet,
+		Arr:              arrInst,
+		Action:           entry.Action,
+		DownloadUncached: downloadUncached,
+		CallBackUrl:      entry.CallbackURL,
+		SkipMultiSeason:  entry.SkipMultiSeason,
+		Type:             ImportTypeAPI,
+	}
+}
+
 // resumeRateLimitedRetries restarts the in-memory retry chain for any Entry
 // that was waiting on a submission-rate-limited backoff when the previous
 // process died. Without this, a container restart strands every such entry
@@ -336,38 +416,9 @@ func (m *Manager) resumeRateLimitedRetries(ctx context.Context) {
 			continue
 		}
 
-		magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
-		if err != nil {
-			magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
-		}
-		if magnet == nil || magnet.Link == "" {
-			m.logger.Warn().Str("hash", entry.InfoHash).Msg("resume-rate-limited: failed to reconstruct magnet")
+		importReq := m.reconstructImportRequestFromEntry(entry)
+		if importReq == nil {
 			continue
-		}
-
-		arrInst := m.arr.GetOrCreate(entry.Category)
-		downloadFolder := filepath.Dir(entry.SavePath)
-		if downloadFolder == "" || downloadFolder == "." {
-			downloadFolder = m.config.QBitTorrent.DownloadFolder
-		}
-
-		var downloadUncached *bool
-		if entry.DownloadUncached {
-			v := true
-			downloadUncached = &v
-		}
-
-		importReq := &ImportRequest{
-			Id:               entry.InfoHash, // doesn't need to be globally unique for this internal restart
-			DownloadFolder:   downloadFolder,
-			SelectedDebrid:   entry.ActiveProvider, // may be empty — SendToDebrid will use config order
-			Magnet:           magnet,
-			Arr:              arrInst,
-			Action:           entry.Action,
-			DownloadUncached: downloadUncached,
-			CallBackUrl:      entry.CallbackURL,
-			SkipMultiSeason:  entry.SkipMultiSeason,
-			Type:             ImportTypeAPI,
 		}
 
 		m.logger.Info().Str("hash", entry.InfoHash).Str("name", entry.Name).Msg("Resuming rate-limited submit retry after restart")

@@ -53,6 +53,10 @@ func (m *Manager) Refresh(dirs []string) error {
 	return m.client.Refresh(context.Background(), dirs, "")
 }
 
+// ClearEntry is a no-op for the external mount manager — cache management
+// lives in the upstream rclone process, not us.
+func (m *Manager) ClearEntry(entryName string) {}
+
 func (m *Manager) IsReady() bool {
 	return true
 }

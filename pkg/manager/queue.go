@@ -94,6 +94,18 @@ type Queue struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	cond   *sync.Cond // For blocking operations
+
+	// clearCache is set by Manager after construction (mountManager isn't
+	// available at newQueue time). When non-nil, the cleanup wrapper calls
+	// it to purge dfs cache state for the deleted entry.
+	clearCache func(entryName string)
+}
+
+// SetClearCache wires the dfs-cache cleanup hook. Called by Manager once
+// mountManager is initialised; pass nil to detach. Safe to call concurrently
+// with cleanup; the wrap loads the field via a fresh read each invocation.
+func (q *Queue) SetClearCache(fn func(entryName string)) {
+	q.clearCache = fn
 }
 
 func newQueue(ctx context.Context, storage *storage.Storage, capacity int, removeStalledAfterStr string) *Queue {
@@ -158,6 +170,15 @@ func (q *Queue) deleteEntryFiles(entry *storage.Entry) {
 func (q *Queue) wrapCleanupWithFileDelete(cleanup func(t *storage.Entry) error) func(*storage.Entry) error {
 	return func(entry *storage.Entry) error {
 		q.deleteEntryFiles(entry)
+		// Purge the dfs cache for this entry so abandoned cache files
+		// don't accumulate. Set lazily by the Manager once mountManager
+		// is wired; nil for the brief window before that and for arr/
+		// rclone mount backends that don't own a cache.
+		if fn := q.clearCache; fn != nil {
+			if folder := entry.GetFolder(); folder != "" {
+				fn(folder)
+			}
+		}
 		if cleanup != nil {
 			return cleanup(entry)
 		}

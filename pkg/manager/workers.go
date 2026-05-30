@@ -2,16 +2,23 @@ package manager
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // runInitialCalls performs any initial calls of worker functions
 // for example, call the trackAvailableSlots and processQueuedEntries functions once
 func (m *Manager) runInitialCalls(ctx context.Context) {
+	// Restore persisted state BEFORE the queue/refresh workers start, so
+	// they make their first decisions with full history (provider
+	// cooldowns won't get burned by a too-eager first submit).
+	m.restoreProviderSubmitCooldowns()
+
 	// Initial call to track available slots
 	go m.refreshDownloadLinks(ctx)
 	go m.trackAvailableSlots(ctx)
@@ -106,7 +113,73 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 			}
 		}
 	}
+
+	// Daily EntryHealth tombstone GC. Tombstones are written when sync
+	// drops a placement (pkg/manager/torrent.go:writeSyncDeletionTombstone)
+	// so the repair sweep can later see which arr libraries to recover.
+	// They only get deleted today when the sweep actively repairs the
+	// entry, so over time the repair_state.db accumulates dead rows for
+	// entries that aged out, were recovered manually, or whose arr media
+	// item was deleted entirely. This 24h job sweeps tombstones older
+	// than 30 days that no longer have a matching arr record.
+	if jd, err := utils.ConvertToJobDef("24h"); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert tombstone GC interval")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			m.runTombstoneGC(ctx)
+		}), gocron.WithContext(ctx), gocron.WithName("tombstone-gc")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create tombstone GC job")
+		} else {
+			m.logger.Debug().Msg("EntryHealth tombstone GC scheduled for every 24h")
+		}
+	}
 	return nil
+}
+
+// runTombstoneGC walks EntryHealth records, deleting any sync-deletion
+// tombstone older than the retention threshold. We deliberately skip
+// rows without a SyncTombstoneAt marker so this never touches live
+// broken-state records — only the historical sync-deletion bread crumbs.
+//
+// 30 days is a wide retention window on purpose: the repair sweep has
+// ample time to act on a fresh tombstone within that period. Anything
+// still sitting at 30+ days is dead state, either because the arr media
+// item was deleted entirely, the user fixed it manually, or the sweep
+// couldn't recover (e.g. content is permanently dead on every debrid).
+func (m *Manager) runTombstoneGC(ctx context.Context) {
+	const tombstoneRetention = 30 * 24 * time.Hour
+	cutoff := time.Now().Add(-tombstoneRetention)
+	scanned := 0
+	deleted := 0
+
+	_ = m.storage.ForEachEntryHealth(func(h *storage.EntryHealth) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		scanned++
+
+		// Only act on rows that are tombstones (sync-deletion bread
+		// crumbs). Live broken-state records have an empty SyncTombstoneAt.
+		if h.SyncTombstoneAt.IsZero() {
+			return nil
+		}
+		if h.SyncTombstoneAt.After(cutoff) {
+			return nil // still within retention window
+		}
+
+		if err := m.storage.DeleteEntryHealth(h.EntryName); err != nil {
+			m.logger.Warn().Err(err).Str("entry", h.EntryName).Msg("tombstone-gc: delete failed")
+			return nil
+		}
+		deleted++
+		return nil
+	})
+
+	if deleted > 0 {
+		m.logger.Info().Int("scanned", scanned).Int("deleted", deleted).Msg("[tombstone-gc] sweep complete")
+	}
 }
 
 func (m *Manager) StartWorker(ctx context.Context) error {

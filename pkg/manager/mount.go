@@ -23,6 +23,11 @@ type MountManager interface {
 	IsReady() bool
 	Type() string
 	Refresh(dirs []string) error
+	// ClearEntry removes all dfs-cache state for the given entry name.
+	// Called when an Entry is deleted so the cache doesn't accumulate
+	// abandoned data+meta files for vanished entries. Implementations
+	// that don't own a dfs cache (rclone, external, stub) may no-op.
+	ClearEntry(entryName string)
 }
 
 func (m *Manager) RefreshEntries(refreshMount bool) {
@@ -101,6 +106,8 @@ type stubMountManager struct{}
 func (s *stubMountManager) Refresh(dirs []string) error {
 	return nil
 }
+
+func (s *stubMountManager) ClearEntry(entryName string) {}
 
 func NewStubMountManager() MountManager {
 	return &stubMountManager{}

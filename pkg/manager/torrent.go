@@ -77,9 +77,23 @@ func (m *Manager) refreshTorrents(ctx context.Context, provider string, debridCl
 func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridClient debrid.Client) error {
 	remote, err := debridClient.GetTorrents()
 	if err != nil {
-		m.logger.Error().Err(err).Str("debrid", provider).Msg("Failed to get remote")
+		// Increment partial-fetch counter so sustained backend issues
+		// (provider down, account locked, persistent rate-limit) stop
+		// being invisible. A single failure is normal noise; >=5 in a
+		// row is something an operator should know about.
+		count, _ := m.syncPartialFetches.Load(provider)
+		count++
+		m.syncPartialFetches.Store(provider, count)
+		level := m.logger.Error()
+		if count >= 5 {
+			level = m.logger.Warn() // upgrade to a visible warning at sustained-failure threshold
+		}
+		level.Err(err).Str("debrid", provider).Int("consecutive_partial_fetches", count).Msg("Failed to get remote")
 		return err
 	}
+	// Reset the partial-fetch counter on success so the next failure
+	// counts as the first of a new streak.
+	m.syncPartialFetches.Delete(provider)
 
 	if len(remote) == 0 {
 		m.logger.Debug().Str("debrid", provider).Msg("No remote found")
@@ -484,6 +498,18 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 	if t.Status == types.TorrentStatusDownloaded {
 		downloadedAt := addedOn
 		placement.DownloadedAt = &downloadedAt
+		// Entry-level completion timestamp: required so qBit-compat
+		// /torrents/info reports a sensible completion_on. The newly-
+		// imported path (downloader.completeEntry → MarkAsCompleted at
+		// downloader.go:140) sets this for entries decypharr adds itself,
+		// but the SYNC-discovered path (a torrent that was already on the
+		// debrid when decypharr first looked) never went through that
+		// codepath. Without this, qBit's completion_on falls back to
+		// CreatedAt — works incidentally but breaks if the entry was
+		// created long before its completion timestamp matters.
+		if mt.CompletedAt == nil {
+			mt.CompletedAt = &downloadedAt
+		}
 	}
 
 	// If this is the first placement or the only one, make it active

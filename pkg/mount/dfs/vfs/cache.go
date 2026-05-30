@@ -479,6 +479,53 @@ func (c *Cache) Close() error {
 	return nil
 }
 
+// ClearEntry removes every cache item belonging to entryName, both from
+// the in-memory map and from disk. Called when an Entry is deleted (via
+// arr-driven qBit DELETE or Manager.DeleteEntry) so the dfs cache doesn't
+// keep accumulating directories for entries that no longer exist.
+//
+// Items with active file handles (opens > 0) are skipped — eviction sees
+// the same constraint at evictCandidates() and we honour it here to avoid
+// pulling the rug out from under an in-flight read. Their on-disk files
+// will get reclaimed by the next age/size eviction pass once handles close.
+// totalSize is re-reconciled by the next eviction pass; we don't track
+// freed bytes here to avoid reaching into CacheItem internals.
+func (c *Cache) ClearEntry(entryName string) {
+	if entryName == "" {
+		return
+	}
+	prefix := entryName + "/"
+	removedCount := 0
+	c.items.Range(func(key string, item *CacheItem) bool {
+		if key != entryName && !strings.HasPrefix(key, prefix) {
+			return true
+		}
+		if item.opens.Load() > 0 {
+			// In-flight read; eviction will reclaim on the next pass.
+			return true
+		}
+		if err := item.Close(); err != nil {
+			c.logger.Warn().Err(err).Str("key", key).Msg("ClearEntry: failed to close item")
+		}
+		c.items.Delete(key)
+		c.itemCount.Add(-1)
+		removedCount++
+		return true
+	})
+
+	// Remove the on-disk entry directory wholesale, including any
+	// orphaned data+meta files for cache items that were never loaded
+	// into memory in this process lifetime.
+	entryDir := filepath.Join(c.config.CacheDir, entryName)
+	if err := os.RemoveAll(entryDir); err != nil && !os.IsNotExist(err) {
+		c.logger.Warn().Err(err).Str("dir", entryDir).Msg("ClearEntry: failed to remove on-disk entry dir")
+	}
+
+	if removedCount > 0 {
+		c.logger.Debug().Str("entry", entryName).Int("removed_items", removedCount).Msg("ClearEntry: cache pruned")
+	}
+}
+
 // RecordCacheHit increments the cache hit counter.
 func (c *Cache) RecordCacheHit() {
 	c.cacheHits.Add(1)

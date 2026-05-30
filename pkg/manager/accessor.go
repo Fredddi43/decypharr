@@ -14,6 +14,13 @@ import (
 
 func (m *Manager) SetMountManager(mountMgr MountManager) {
 	m.mountManager = mountMgr
+	// Hook the dfs-cache cleanup into the queue's delete path so cache
+	// state is purged when an Entry is removed (arr qBit-compat DELETE,
+	// Manager.DeleteEntry, etc). Safe even for backends that don't own a
+	// cache — their ClearEntry is a no-op.
+	if m.queue != nil && mountMgr != nil {
+		m.queue.SetClearCache(mountMgr.ClearEntry)
+	}
 }
 
 // Repair returns the repair service. It is created during init() so callers

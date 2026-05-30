@@ -109,6 +109,16 @@ func (m *Manager) Refresh(dirs []string) error {
 	return nil
 }
 
+// ClearEntry purges dfs-cache state for an Entry. Called by the manager
+// package when an Entry is deleted (via arr qBit-compat DELETE or
+// Manager.DeleteEntry) so abandoned cache files don't pile up.
+func (m *Manager) ClearEntry(entryName string) {
+	if m.vfs == nil {
+		return
+	}
+	m.vfs.ClearEntry(entryName)
+}
+
 // Stats returns unified statistics across all DFS mounts
 func (m *Manager) Stats() map[string]interface{} {
 	// Aggregate stats from all mounts

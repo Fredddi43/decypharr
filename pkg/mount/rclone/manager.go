@@ -321,6 +321,10 @@ func (m *Manager) GetLogger() zerolog.Logger {
 	return m.logger
 }
 
+// ClearEntry is a no-op for the rclone mount manager — cache management
+// lives in the upstream rclone process, not us.
+func (m *Manager) ClearEntry(entryName string) {}
+
 func (m *Manager) Type() string {
 	return "rclone"
 }

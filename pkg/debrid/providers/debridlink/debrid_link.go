@@ -457,7 +457,15 @@ func (dl *DebridLink) GetTorrents() ([]*types.Torrent, error) {
 		page++
 	}
 	if fetchErr != nil {
-		return torrents, fetchErr
+		// PARTIAL FETCH: same contract as RealDebrid (realdebrid.go:967-968)
+		// and TorBox post-0cb58ac — return (nil, err) rather than partial
+		// data + error. Caller in pkg/manager/torrent.go:78 bails on err
+		// before any sync miss-counter increments, so an incomplete page
+		// can't poison entry state. If we returned the partial slice with
+		// err, a future caller that forgets the err-check would treat it
+		// as authoritative and false-delete every entry the partial page
+		// happened to miss.
+		return nil, fmt.Errorf("debridlink GetTorrents: partial fetch at page=%d (%d collected): %w", page, len(torrents), fetchErr)
 	}
 	return torrents, nil
 }

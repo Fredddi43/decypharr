@@ -109,6 +109,10 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 	var lastErr error
 	totalAttempts := 0
+	anyTransient := false // set when ≥1 provider in the cascade returned a
+	// transient (rate-limit / 5xx) error. Drives the deferred-retry path
+	// after the loop so we don't immediately blocklist+research a
+	// recoverable entry while a debrid is just on cooldown.
 
 	for _, debridName := range attemptOrder {
 		// Check if entry has been marked as failed to re-insert
@@ -171,6 +175,7 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 		if !isTransientSubmitError(err) {
 			f.failedToReinsert.Store(fmt.Sprintf("%s:%s", entry.InfoHash, debridName), struct{}{})
 		} else {
+			anyTransient = true
 			f.manager.logger.Debug().
 				Err(err).
 				Str("debrid", debridName).
@@ -179,7 +184,46 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 		}
 	}
 
-	// All debrids failed - mark as completely failed
+	// All debrids failed in this pass.
+	//
+	// If ANY provider returned a transient error (rate-limit, 5xx, hoster
+	// temporarily unavailable), defer the entry to the existing retry
+	// chain instead of immediately blocklist+research. The retry chain
+	// (retryRateLimitedSubmit) handles the exact pattern we want here:
+	// exponential backoff against the cooled-down providers, automatic
+	// give-up after N attempts. Without this branch, a 10-minute TorBox
+	// quota dip during a cascade pass causes the arr to blocklist a
+	// perfectly good release.
+	if anyTransient {
+		importReq := f.manager.reconstructImportRequestFromEntry(entry)
+		if importReq != nil {
+			entry.State = storage.EntryStateDownloading
+			entry.IsDownloading = false
+			if !hasTag(entry.Tags, "submission-rate-limited") {
+				entry.Tags = append(entry.Tags, "submission-rate-limited")
+			}
+			_ = f.manager.AddOrUpdate(entry, nil)
+			f.manager.logger.Info().
+				Str("infohash", entry.InfoHash).
+				Int("attempts", totalAttempts).
+				Msg("Fixer cascade hit a transient — deferring to retry chain instead of blocklisting")
+			go f.manager.retryRateLimitedSubmit(ctx, importReq, entry, 1)
+
+			result := &FixResult{
+				Success:       false,
+				Error:         fmt.Errorf("deferred to retry chain after transient: %w", lastErr),
+				AttemptsCount: totalAttempts,
+			}
+			req.result <- result
+			return result, nil // not result.Error — we DON'T want the caller to escalate
+		}
+		// importReq reconstruction failed (no magnet on entry). Fall
+		// through to the permanent-fail path below.
+	}
+
+	// All debrids failed and none were transient (or we couldn't defer) —
+	// mark as completely failed so the queue janitor sweepDecypharrErrors
+	// picks it up next pass and asks the arr to blocklist+research.
 	f.manager.logger.Error().
 		Err(lastErr).
 		Str("infohash", entry.InfoHash).
@@ -188,13 +232,6 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 	f.failedToReinsert.Store(entry.InfoHash, struct{}{})
 
-	// Mark entry as bad AND transition state to error so the queue janitor's
-	// sweepDecypharrErrors picks it up next pass — that path will ask the
-	// arr to blocklist the release and re-search, which is the only thing
-	// that can rescue this (a different release for the same media may not
-	// trip the same provider-side rejection). Without MarkAsError the entry
-	// just sat in pausedUP with Bad=true forever, the arr kept polling the
-	// import, and no sweep removed it.
 	entry.Bad = true
 	if lastErr != nil {
 		entry.MarkAsError(fmt.Errorf("all re-insertion attempts failed: %w", lastErr))

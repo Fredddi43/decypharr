@@ -63,6 +63,17 @@ func (m *Manager) GetManager() *manager.Manager {
 	return m.manager
 }
 
+// ClearEntry purges dfs-cache state for an Entry that's been deleted.
+// Forwards to the underlying Cache; called via dfs.Manager.ClearEntry →
+// vfs.Manager.ClearEntry → cache.ClearEntry from manager.Queue's cleanup
+// path when an Entry is removed.
+func (m *Manager) ClearEntry(entryName string) {
+	if m.cache == nil {
+		return
+	}
+	m.cache.ClearEntry(entryName)
+}
+
 // GetFile returns a streaming file handle
 func (m *Manager) GetFile(info *manager.FileInfo) (*StreamingFile, error) {
 	key := buildFileKey(info.Parent(), info.Name())
