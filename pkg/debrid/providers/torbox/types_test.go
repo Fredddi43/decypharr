@@ -96,3 +96,53 @@ func TestInfoResponseUnmarshalErrorContext(t *testing.T) {
 		t.Fatalf("error should mention both shape options, got: %q", err.Error())
 	}
 }
+
+// TestDownloadLinksResponseUnmarshal verifies that the /requestdl response
+// shape (data:string with the resolved CDN URL) parses cleanly. The
+// fetchDownloadLink path depends on this so it can store the CDN URL
+// directly instead of the /requestdl endpoint URL — see the 2026-05-30
+// "burning 50 /requestdl calls per playback" fix.
+func TestDownloadLinksResponseUnmarshal(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantNil bool
+		wantURL string
+	}{
+		{
+			name:    "cdn_url",
+			body:    `{"success":true,"error":null,"detail":"ok","data":"https://nexus-114.japn.tb-cdn.pw/dld/abc?token=xyz"}`,
+			wantURL: "https://nexus-114.japn.tb-cdn.pw/dld/abc?token=xyz",
+		},
+		{
+			name:    "null_data",
+			body:    `{"success":false,"error":"missing","detail":"no link","data":null}`,
+			wantNil: true,
+		},
+		{
+			name:    "empty_string_data",
+			body:    `{"success":false,"detail":"none","data":""}`,
+			wantURL: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var r DownloadLinksResponse
+			if err := json.Unmarshal([]byte(tc.body), &r); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+			if tc.wantNil {
+				if r.Data != nil {
+					t.Fatalf("expected Data=nil, got %q", *r.Data)
+				}
+				return
+			}
+			if r.Data == nil {
+				t.Fatalf("expected Data set, got nil")
+			}
+			if *r.Data != tc.wantURL {
+				t.Fatalf("URL: want %q got %q", tc.wantURL, *r.Data)
+			}
+		})
+	}
+}

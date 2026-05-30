@@ -549,23 +549,49 @@ func (tb *Torbox) GetDownloadLink(id string, file *types.File) (types.DownloadLi
 }
 
 func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
-	query := url.Values{}
-	query.Set("token", account.Token)
-	query.Set("torrent_id", id)
-	query.Set("file_id", file.Id)
-	query.Set("redirect", "true")
-
-	downloadURL := fmt.Sprintf("%s/api/torrents/requestdl?%s", tb.Host, query.Encode())
+	// Resolve the CDN URL ONCE by calling /api/torrents/requestdl with
+	// redirect=false and caching the URL in the returned DownloadLink.
+	//
+	// Previously this constructed `/requestdl?...&redirect=true` and stored
+	// THAT as the download URL. Every byte fetch from the FUSE/webdav layer
+	// then re-hit /requestdl (TorBox's API would 302 to the CDN, the HTTP
+	// client followed). For a Plex playback that issues ~50 range requests
+	// during codec detection, that meant ~50 /requestdl calls per file.
+	// Multiplied by parallel scrubs + rclone cache misses, the per-account
+	// 300/min /requestdl budget got saturated within seconds, and every
+	// subsequent read returned 429 (surfaced as `failed to get download
+	// link: 429: HTTP 429 Too Many Requests` in the webdav error log).
+	//
+	// With redirect=false TorBox returns the resolved CDN URL in the JSON
+	// `data` field. Storing THAT as DownloadLink.DownloadLink means
+	// subsequent range reads hit the CDN directly — /requestdl is consulted
+	// only when the URL expires (Stream's 404/410 path triggers a
+	// RefreshLink, which calls fetchDownloadLink again).
+	var res DownloadLinksResponse
+	resp, err := tb.doGet("/api/torrents/requestdl", map[string]string{
+		"token":      account.Token,
+		"torrent_id": id,
+		"file_id":    file.Id,
+		"redirect":   "false",
+	}, &res)
+	if err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl: %d", resp.StatusCode)
+	}
+	if !res.Success || res.Data == nil || *res.Data == "" {
+		return types.DownloadLink{}, fmt.Errorf("torbox requestdl: empty data (success=%v, detail=%q)", res.Success, res.Detail)
+	}
+	cdnURL := *res.Data
 
 	now := time.Now()
-
-	// Always expires
 	dl := types.DownloadLink{
 		Filename:     file.Name,
 		Size:         file.Size,
 		Token:        tb.APIKey,
 		Link:         file.Link,
-		DownloadLink: downloadURL,
+		DownloadLink: cdnURL,
 		Debrid:       tb.config.Name,
 		Id:           file.Id,
 		Generated:    now,
