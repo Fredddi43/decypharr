@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -16,6 +17,12 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"golang.org/x/sync/singleflight"
 )
+
+// linkFetchTimeout caps the in-flight singleflight fetch independently of
+// any one caller's context. Larger than a typical /requestdl round-trip
+// (<1s) plus account-cache lookup, with headroom for transient TorBox
+// slowdowns. Bounds blast radius if a fetch ever hangs upstream.
+const linkFetchTimeout = 30 * time.Second
 
 const (
 	MaxReinsertionAttempt = 3
@@ -77,17 +84,42 @@ func New(
 // GetLink fetches and validates a download link for a file in an entry.
 // Links are cached at the account level; this service only tracks validation state.
 func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename string) (types.DownloadLink, error) {
-	// Use singleflight to deduplicate concurrent requests for the same file
+	// Deduplicate concurrent requests for the same file via singleflight.
+	//
+	// IMPORTANT: the fetch runs under its OWN background context, not the
+	// caller's ctx. With singleflight.Do, the closure captures the first
+	// caller's ctx; if that caller disconnects (Plex client gives up on a
+	// scrub, rclone times out a chunk, etc.) the in-flight fetch sees ctx
+	// cancellation and aborts mid-validation. Every queued caller then
+	// inherits the failed result, the file becomes "stuck" for the
+	// duration of the cascade, and decypharr surfaces it as
+	// `failed to get download link: network_error: HEAD request failed:
+	// context canceled` in 0.7ms. Hit on Drama + Freddy 2 reliably on
+	// 2026-05-31 because Plex's 2160p codec scan fires many parallel
+	// ranges and one of them always cancels first.
+	//
+	// Fix: DoChan + a fresh background ctx (bounded by linkFetchTimeout)
+	// for the fetch, and a select on the caller's ctx for the wait. Each
+	// caller can give up independently without poisoning the shared
+	// fetch.
 	key := entry.InfoHash + ":" + filename
-	v, err, _ := s.singleflight.Do(key, func() (interface{}, error) {
-		return s.fetchAndValidate(ctx, entry, filename, 0)
+	ch := s.singleflight.DoChan(key, func() (interface{}, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), linkFetchTimeout)
+		defer cancel()
+		return s.fetchAndValidate(fetchCtx, entry, filename, 0)
 	})
 
-	if err != nil {
-		return emptyDownloadLink, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return emptyDownloadLink, res.Err
+		}
+		return res.Val.(types.DownloadLink), nil
+	case <-ctx.Done():
+		// Caller went away — they get a cancel, the in-flight fetch
+		// continues so the next caller can use its result.
+		return emptyDownloadLink, ctx.Err()
 	}
-
-	return v.(types.DownloadLink), nil
 }
 
 func (s *Service) getClient(provider string) (debrid.Client, error) {
