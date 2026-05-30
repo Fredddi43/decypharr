@@ -2,11 +2,14 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -157,8 +160,23 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 		}
 
 		lastErr = err
-		// Add failed state for this debrid
-		f.failedToReinsert.Store(fmt.Sprintf("%s:%s", entry.InfoHash, debridName), struct{}{})
+		// Only persist a "this provider is dead for this hash" verdict for
+		// permanent rejections — DMCA / not-cached / "the file simply isn't
+		// there for this provider". Transient failures (rate-limit, 5xx,
+		// hoster temporarily unavailable, slot exhaustion) must NOT poison
+		// the cascade: marking them here is how a 10-minute TorBox quota
+		// dip ends up making every future FUSE read EIO for the entry's
+		// lifetime, because the link service's repair pass will skip the
+		// only viable provider forever (cleared only by process restart).
+		if !isTransientSubmitError(err) {
+			f.failedToReinsert.Store(fmt.Sprintf("%s:%s", entry.InfoHash, debridName), struct{}{})
+		} else {
+			f.manager.logger.Debug().
+				Err(err).
+				Str("debrid", debridName).
+				Str("infohash", entry.InfoHash).
+				Msg("Transient submit failure — leaving cascade marker unset")
+		}
 	}
 
 	// All debrids failed - mark as completely failed
@@ -363,7 +381,45 @@ func (f *Fixer) IsFailedToReinsert(infohash, debrid string) bool {
 	return failed
 }
 
-// ResetFailureState manually resets the failure state for a torrent
+// ResetFailureState clears every failed-marker associated with this infohash —
+// both the bare-hash "all providers exhausted" marker AND any per-(hash,
+// provider) entries from earlier cascade attempts. Without the prefix sweep
+// a previously-failed sibling provider stays poisoned forever, and the next
+// FUSE read can't fail over to it even after it's recovered.
 func (f *Fixer) ResetFailureState(infohash string) {
 	f.failedToReinsert.Delete(infohash)
+	prefix := infohash + ":"
+	f.failedToReinsert.Range(func(key string, _ struct{}) bool {
+		if strings.HasPrefix(key, prefix) {
+			f.failedToReinsert.Delete(key)
+		}
+		return true
+	})
+}
+
+// ClearProviderFailure drops a single (hash, provider) marker — e.g. after a
+// fresh SubmitMagnet on that provider succeeded, so the cascade should no
+// longer skip it.
+func (f *Fixer) ClearProviderFailure(infohash, debrid string) {
+	f.failedToReinsert.Delete(fmt.Sprintf("%s:%s", infohash, debrid))
+}
+
+// isTransientSubmitError reports whether an err returned by a provider's
+// SubmitMagnet (or wrapping callers) represents a transient condition that
+// the same provider can still recover from on retry — versus a permanent
+// rejection where re-submitting hits the same wall.
+func isTransientSubmitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, customerror.RateLimitedError) ||
+		errors.Is(err, customerror.HosterUnavailableError) ||
+		errors.Is(err, customerror.TooManyActiveDownloadsError) {
+		return true
+	}
+	var customErr *customerror.Error
+	if errors.As(err, &customErr) && customErr.IsRetryable() {
+		return true
+	}
+	return false
 }

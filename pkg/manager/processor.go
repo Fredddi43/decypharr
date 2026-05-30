@@ -610,6 +610,15 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			continue
 		}
 		dbt.Arr = importRequest.Arr
+		// SubmitMagnet just proved this provider is viable for this hash —
+		// drop any stale "(hash,provider) is dead" cascade marker so a
+		// subsequent FUSE-read repair pass doesn't keep skipping it. Without
+		// this clear, a single transient rate-limit during an earlier
+		// cascade attempt poisons reads for the entry's lifetime (only
+		// cleared by process restart).
+		if m.fixer != nil {
+			m.fixer.ClearProviderFailure(debridTorrent.InfoHash, db.Config().Name)
+		}
 		_logger.Info().Str("id", dbt.Id).Msgf("Entry: %s submitted to %s", dbt.Name, db.Config().Name)
 
 		torrent, err := db.CheckStatus(dbt)
