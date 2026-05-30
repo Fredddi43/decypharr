@@ -237,30 +237,114 @@ func (r *Repair) orphanProbe(c *candidate) []fileResult {
 	return results
 }
 
+// readProbeTimeout caps a single ReadAt during the orphan probe. FUSE reads
+// against the dfs cache layer normally complete in <2s when the file is
+// healthy; >readProbeTimeout strongly suggests the underlying provider has
+// stopped serving bytes for this entry.
+const readProbeTimeout = 30 * time.Second
+
+// readProbeBufSize is small on purpose — we're not benchmarking throughput,
+// just confirming the FS can deliver real bytes from three offsets.
+const readProbeBufSize = 65536 // 64 KiB
+
 // checkArrSymlinkBroken is the universal correctness check for a library
-// symlink. It stats the SYMLINK path itself (arr-side, e.g.
-// /data/media/movies/.../file.mkv) which causes os.Stat to follow the
-// link and reach the FUSE-served target — if the target is gone (debrid
-// dropped the file) the stat returns ErrNotExist.
+// symlink. It does two layers of probe:
 //
-// Returns (broken=true, reason) when the link resolves to nothing or
-// returns a non-ENOENT error; (false, "") when fully readable. The
-// two-pass confirmation gate suppresses single-stat transients.
+//  1. os.Stat on the SYMLINK path itself (arr-side, e.g.
+//     /data/media/movies/.../file.mkv) which follows into the FUSE-served
+//     target. If the target is gone (debrid dropped the entire entry),
+//     stat returns ErrNotExist.
 //
-// Empty input or os.Lstat-confirmed "not a symlink" is reported as
-// (false, "") — those aren't our concern here; collectArrFiles has
-// already filtered them out by the time we get here.
+//  2. If stat succeeds AND the file claims a non-zero size, a three-offset
+//     ReadAt probe (head, mid, near-end). When FUSE's metadata layer keeps
+//     serving correct size/mode but the underlying placement linkage is
+//     dead — the "active_debrid empty / dfs cache ranges null" orphan
+//     class we hit ~1000 times on 2026-05-30 — all three reads return 0
+//     bytes silently. stat-only detection missed this entire class.
+//
+// Returns (broken=true, reason) when EITHER layer flags the file; (false,
+// "") when everything responds. Empty input is reported as (false, "");
+// callers should not pass empty paths.
+//
+// The two-pass confirmation gate in the surrounding sweep suppresses
+// single-probe transients (FUSE remount mid-probe, etc.).
 func checkArrSymlinkBroken(symlinkPath string) (bool, string) {
 	if symlinkPath == "" {
 		return false, ""
 	}
-	if _, err := os.Stat(symlinkPath); err != nil {
+	info, err := os.Stat(symlinkPath)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return true, "target_missing"
 		}
 		return true, "target_stat_error: " + err.Error()
 	}
-	return false, ""
+	size := info.Size()
+	if size <= 0 {
+		// Zero-byte file (or directory) — read probe would be meaningless.
+		// We never see this for arr-managed media in practice.
+		return false, ""
+	}
+	return readProbeBroken(symlinkPath, size)
+}
+
+// readProbeBroken opens the symlink target and reads 64 KiB at head, mid,
+// and near-end offsets. If ALL three return zero bytes on a known
+// non-empty file the entry is in the orphan-but-stat-succeeds state.
+// Per-read timeout (readProbeTimeout) guards against hung FUSE calls; a
+// timeout counts as zero-bytes for the all-zero check (a stuck read is
+// indistinguishable from a dead placement at this layer).
+//
+// Returns (true, "all_reads_zero" | "read_error: …") on broken, (false, "")
+// on healthy (at least one read returned >0 bytes).
+func readProbeBroken(path string, size int64) (bool, string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return true, "open_error: " + err.Error()
+	}
+	defer f.Close()
+
+	// Three offsets, all clamped inside the file.
+	offsets := []int64{0}
+	if size > readProbeBufSize*2 {
+		offsets = append(offsets, size/2)
+		end := size - readProbeBufSize
+		if end > 0 && end != size/2 && end != 0 {
+			offsets = append(offsets, end)
+		}
+	}
+
+	type probeResult struct {
+		n   int
+		err error
+	}
+	for _, off := range offsets {
+		buf := make([]byte, readProbeBufSize)
+		ch := make(chan probeResult, 1)
+		go func(off int64) {
+			n, rerr := f.ReadAt(buf, off)
+			ch <- probeResult{n, rerr}
+		}(off)
+		select {
+		case res := <-ch:
+			if res.n > 0 {
+				// At least one offset returned real bytes — file is alive,
+				// not an orphan. Other reads (if any) might be slower or
+				// EIO transiently, but the file is responding.
+				return false, ""
+			}
+			// 0 bytes: could be silent EOF on a known non-empty file
+			// (orphan signal) or could be EIO from FUSE (also orphan). Both
+			// count toward all-zero. Keep looping.
+		case <-time.After(readProbeTimeout):
+			// Stuck read — treat as no-bytes-returned; equivalent to EIO
+			// for our purposes. We don't return early because we want to
+			// give the other offsets a chance to disprove the orphan
+			// hypothesis (a single slow offset shouldn't condemn an
+			// otherwise-healthy file).
+		}
+	}
+	return true, "all_reads_zero"
 }
 
 // probeEntry probes one entry: marks it repairing, probes its files (≤2 in
