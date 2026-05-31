@@ -638,7 +638,20 @@ func (j *QueueJanitor) sweepDecypharrErrors(ctx context.Context, arrs []*arr.Arr
 		// state=error and skip — next time the entry is re-submitted
 		// (by AddNewTorrent, the repair sweep, or manual user action)
 		// it'll cycle back through SendToDebrid cleanly.
-		if isTransientErrorReason(entry.LastError) {
+		//
+		// EXCEPTION: entries tagged `submission-rate-limit-exhausted`
+		// already spent the retry chain's full attempt budget
+		// (rateLimitMaxAttempts) and still failed. The chain is the
+		// authoritative "we gave the transient path its chances" signal
+		// — without the override here, those entries get stranded in
+		// state=error because the LastError text still matches "rate
+		// limit" / "timeout" / etc., and nothing else re-submits them.
+		// Sonarr/Radarr's failed-download-handler is the right next
+		// step: blocklist this release name + research for a different
+		// release. Observed 2026-05-31: Lazarus S01E08 sat in state=error
+		// for hours after exhaustion without sonarr ever getting the
+		// blocklist signal to re-search.
+		if !hasTag(entry.Tags, "submission-rate-limit-exhausted") && isTransientErrorReason(entry.LastError) {
 			j.logger.Debug().Str("hash", entry.InfoHash).Str("reason", truncate(entry.LastError, 80)).Msg("Skipping Decypharr error entry — transient failure, will be retried")
 			continue
 		}
