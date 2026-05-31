@@ -146,3 +146,64 @@ func TestDownloadLinksResponseUnmarshal(t *testing.T) {
 		})
 	}
 }
+
+// TestIsTransientTorboxRejection verifies the HTTP-400-as-retry classification
+// added 2026-05-31 in response to TorBox returning "No servers available for
+// download this torrent. Please try again later." with HTTP 400 instead of
+// 429. Without this, the manager would mark the entry state=error and the
+// queue janitor would prematurely blocklist the release in the arr.
+func TestIsTransientTorboxRejection(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    bool
+	}{
+		{
+			name: "no_servers_available_observed_2026_05_31",
+			body: `{"success":false,"error":null,"detail":"No servers available for download this torrent. Please try again later."}`,
+			want: true,
+		},
+		{
+			name: "try_again_later_generic",
+			body: `{"success":false,"detail":"Service temporarily unavailable, please try again later."}`,
+			want: true,
+		},
+		{
+			name: "queue_is_full",
+			body: `{"success":false,"detail":"Submit queue is full"}`,
+			want: true,
+		},
+		{
+			name: "permanent_dmca_rejection_NOT_transient",
+			body: `{"success":false,"error":"infringing_content","detail":"Content rejected for copyright reasons"}`,
+			want: false,
+		},
+		{
+			name: "malformed_magnet_NOT_transient",
+			body: `{"success":false,"detail":"Invalid magnet link"}`,
+			want: false,
+		},
+		{
+			name: "empty_response_NOT_transient",
+			body: `{"success":false}`,
+			want: false,
+		},
+		{
+			name: "error_field_string_form",
+			body: `{"success":false,"error":"no servers available right now","detail":""}`,
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var r AddMagnetResponse
+			if err := json.Unmarshal([]byte(tc.body), &r); err != nil {
+				t.Fatalf("unmarshal failed: %v", err)
+			}
+			got := isTransientTorboxRejection(&r)
+			if got != tc.want {
+				t.Fatalf("isTransientTorboxRejection: want %v got %v for body %q", tc.want, got, tc.body)
+			}
+		})
+	}
+}

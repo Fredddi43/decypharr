@@ -190,9 +190,18 @@ func (tb *Torbox) doPostFormVia(c *request.Client, endpoint string, formData map
 	}
 	defer resp.Body.Close()
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	// Decode into result on any status code that has a body. TorBox returns
+	// a wrapped JSON shape (Success/Error/Detail/Data) even on non-2xx
+	// responses; callers (especially SubmitMagnet) need to inspect the
+	// Detail / Error fields to distinguish transient capacity errors
+	// ("No servers available for download this torrent. Please try again
+	// later." returned as HTTP 400) from permanent rejections. Surface
+	// decode failures only on 2xx so we don't mask the real error code.
+	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
-			return resp, err
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
 		}
 	}
 
@@ -265,6 +274,55 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
+// transientTorboxRejectionPatterns drives the HTTP-400-as-retry decision. These
+// are substrings TorBox embeds in the response Detail / Error fields when the
+// rejection is explicitly transient (capacity, queueing, "try again later"
+// type messages) rather than a permanent rejection (DMCA, malformed magnet,
+// banned tracker). Lowercased; matched case-insensitively below.
+//
+// Keep this list narrow — false positives here trap forever-broken magnets in
+// the retry chain. When in doubt, prefer the permanent path so the entry
+// fails fast and the arr can re-search a different release.
+var transientTorboxRejectionPatterns = []string{
+	"no servers available",
+	"try again later",
+	"queue is full",
+	"capacity",
+	"temporarily unavailable",
+}
+
+func isTransientTorboxRejection(data *AddMagnetResponse) bool {
+	if data == nil {
+		return false
+	}
+	text := strings.ToLower(data.Detail)
+	if errStr, ok := data.Error.(string); ok {
+		text += " " + strings.ToLower(errStr)
+	}
+	if text == " " || text == "" {
+		return false
+	}
+	for _, p := range transientTorboxRejectionPatterns {
+		if strings.Contains(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func torboxDetailOrError(data *AddMagnetResponse) string {
+	if data == nil {
+		return ""
+	}
+	if data.Detail != "" {
+		return data.Detail
+	}
+	if errStr, ok := data.Error.(string); ok && errStr != "" {
+		return errStr
+	}
+	return "(no detail)"
+}
+
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 
@@ -298,6 +356,21 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		return nil, customerror.RateLimitedError
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Inspect the response body for transient capacity errors that
+		// TorBox returns with HTTP 400 instead of 429. These look like
+		// "No servers available for download this torrent. Please try
+		// again later." — explicitly telling the caller to retry. Without
+		// this classification, the manager's retry chain treats the 400
+		// as a permanent rejection, marks the entry state=error, and the
+		// queue janitor's Decypharr-error sweep blocklists the release in
+		// the arr. For anime releases that frequently hit TorBox capacity
+		// limits, this cascades into "sonarr blocklists every group's
+		// release for the episode" (observed 2026-05-31). Match the
+		// transient strings and surface RateLimitedError so the existing
+		// retry chain handles them like a 429.
+		if isTransientTorboxRejection(&data) {
+			return nil, fmt.Errorf("%w: torbox transient (HTTP %d): %s", customerror.RateLimitedError, resp.StatusCode, torboxDetailOrError(&data))
+		}
 		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
 	}
 	if data.Data == nil {
