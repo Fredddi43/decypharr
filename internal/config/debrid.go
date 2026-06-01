@@ -15,7 +15,8 @@ type Debrid struct {
 	RateLimit                    string   `json:"rate_limit,omitempty"`        // general API ceiling (e.g. 250/minute)
 	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"` // repair sweep
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
-	SubmitRateLimit              string   `json:"submit_rate_limit,omitempty"` // createtorrent / addMagnet / addTorrent — set to 60/hour for TorBox
+	SubmitRateLimit              string   `json:"submit_rate_limit,omitempty"`        // createtorrent / addMagnet / addTorrent — set to 60/hour for TorBox
+	SubmitRateLimitUsenet        string   `json:"submit_rate_limit_usenet,omitempty"` // createusenetdownload — TorBox only; empty → falls back to SubmitRateLimit. Split because the two endpoints may not share a quota bucket server-side.
 	Proxy                        string   `json:"proxy,omitempty"`
 	UnpackRar                    bool     `json:"unpack_rar,omitempty"`
 	MinimumFreeSlot              int      `json:"minimum_free_slot,omitempty"` // Minimum active pots to use this debrid
@@ -150,6 +151,9 @@ func (c *Config) applyDebridEnvVars() {
 			}
 			if v := getEnv(prefix + "SUBMIT_RATE_LIMIT"); v != "" {
 				c.Debrids[i].SubmitRateLimit = v
+			}
+			if v := getEnv(prefix + "SUBMIT_RATE_LIMIT_USENET"); v != "" {
+				c.Debrids[i].SubmitRateLimitUsenet = v
 			}
 			if v := getEnv(prefix + "DOWNLOAD_API_KEY_AUTO_HEAL"); v != "" {
 				b := parseBool(v)

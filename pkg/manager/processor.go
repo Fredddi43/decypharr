@@ -57,17 +57,23 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		Category:         importReq.Arr.Name,
 		SavePath:         filepath.Join(importReq.DownloadFolder, importReq.Arr.Name),
 		Status:           debridTypes.TorrentStatusDownloading,
-		State:            storage.EntryStateDownloading,
-		Progress:         0,
-		Action:           importReq.Action,
-		CallbackURL:      importReq.CallBackUrl,
-		SkipMultiSeason:  importReq.SkipMultiSeason,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		AddedOn:          now,
-		Providers:        make(map[string]*storage.ProviderEntry),
-		Files:            make(map[string]*storage.File),
-		Tags:             []string{},
+		// PendingSubmit: the entry sits in the submission queue until
+		// submitNewTorrentAsync flips it to Downloading once SubmitMagnet
+		// succeeds. Gives the UI a distinct bucket to surface pending
+		// items + a stable place to apply reorder/pause/cancel actions
+		// before the entry has hit the debrid.
+		State:           storage.EntryStatePendingSubmit,
+		Priority:        now.UnixNano(), // FIFO default; move-to-top sets a smaller value
+		Progress:        0,
+		Action:          importReq.Action,
+		CallbackURL:     importReq.CallBackUrl,
+		SkipMultiSeason: importReq.SkipMultiSeason,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		AddedOn:         now,
+		Providers:       make(map[string]*storage.ProviderEntry),
+		Files:           make(map[string]*storage.File),
+		Tags:            []string{},
 	}
 	torrent.ContentPath = torrent.DownloadPath()
 
@@ -163,8 +169,9 @@ func (m *Manager) restoreProviderSubmitCooldowns() {
 func (m *Manager) submitNewTorrentAsync(ctx context.Context, importReq *ImportRequest, entry *storage.Entry) {
 	debridTorrent, err := m.SendToDebrid(ctx, importReq)
 	if err == nil {
-		// Carry over any debrid-side download_uncached decision into the
-		// placeholder entry, then hand off to the normal processor.
+		// Submission accepted by a debrid — transition out of PendingSubmit.
+		// processNewTorrent owns the downstream state machine from here.
+		entry.State = storage.EntryStateDownloading
 		entry.DownloadUncached = debridTorrent.DownloadUncached
 		_ = m.queue.Update(entry)
 		m.processNewTorrent(entry, debridTorrent)

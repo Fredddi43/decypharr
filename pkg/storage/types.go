@@ -25,10 +25,11 @@ const (
 	SwitcherStatusFailed     SwitcherStatus = "failed"
 	SwitcherStatusCancelled  SwitcherStatus = "cancelled"
 
-	EntryStateDownloading TorrentState = "downloading"
-	EntryStatePausedDL    TorrentState = "pausedDL"
-	EntryStatePausedUP    TorrentState = "pausedUP"
-	EntryStateError       TorrentState = "error"
+	EntryStateDownloading   TorrentState = "downloading"
+	EntryStatePausedDL      TorrentState = "pausedDL"
+	EntryStatePausedUP      TorrentState = "pausedUP"
+	EntryStateError         TorrentState = "error"
+	EntryStatePendingSubmit TorrentState = "pendingSubmit" // waiting in the submission queue, not yet sent to debrid
 )
 
 // Common errors
@@ -101,6 +102,16 @@ type Entry struct {
 	LastError     string     `msgpack:"last_error,omitempty" json:"last_error,omitempty"`           // Last error message
 	ErrorCount    int        `msgpack:"error_count,omitempty" json:"error_count,omitempty"`         // Number of errors
 	LastErrorTime *time.Time `msgpack:"last_error_time,omitempty" json:"last_error_time,omitempty"` // Last error time
+
+	// Submission queue: priority + on-disk NZB path. The drainer (see
+	// pkg/manager/processor.go submissionDrainer) sorts pending entries
+	// by Priority ASC, CreatedAt ASC and submits one at a time per
+	// (debrid, protocol) limiter slot. Move-to-top = set priority below
+	// the current min. NZBPath points at /app/nzb_inbox/<hash>.nzb for
+	// usenet entries waiting in the queue; the file is deleted when the
+	// entry transitions out of PendingSubmit.
+	Priority int64  `msgpack:"priority,omitempty" json:"priority,omitempty"`
+	NZBPath  string `msgpack:"nzb_path,omitempty" json:"nzb_path,omitempty"`
 }
 
 func (e *Entry) IsTorrent() bool {
@@ -109,6 +120,10 @@ func (e *Entry) IsTorrent() bool {
 
 func (e *Entry) IsNZB() bool {
 	return e.Protocol == config.ProtocolNZB
+}
+
+func (e *Entry) IsPendingSubmit() bool {
+	return e.State == EntryStatePendingSubmit
 }
 
 func (e *Entry) Validate() error {

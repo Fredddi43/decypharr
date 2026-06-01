@@ -56,13 +56,24 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	rateLimits["repair"] = repairRL
 	rateLimits["download"] = downloadRL
 
-	// Submit bucket: a non-blocking limiter so a saturated provider quota
+	// Submit buckets: non-blocking limiters so a saturated provider quota
 	// (e.g. TorBox's 60/hour /createtorrent cap) yields ErrRateLimitExhausted
 	// immediately, letting SendToDebrid fall over to the next configured
 	// debrid instead of stalling the caller inside ratelimit.Take().
-	var submitAllow *rate.Limiter
+	//
+	// Two buckets: one for the torrent submit endpoint (createtorrent /
+	// addMagnet), one for the Usenet submit endpoint
+	// (createusenetdownload). TorBox may or may not share these quotas
+	// server-side; splitting them client-side means we don't waste half
+	// our budget when they're actually independent. SubmitRateLimitUsenet
+	// falls back to SubmitRateLimit, which falls back to the general
+	// RateLimit — so existing single-bucket configs keep working.
+	var submitAllow, submitAllowUsenet *rate.Limiter
 	if raw := cmp.Or(dc.SubmitRateLimit, dc.RateLimit); raw != "" {
 		submitAllow = utils.ParseNonBlockingRateLimit(raw)
+	}
+	if raw := cmp.Or(dc.SubmitRateLimitUsenet, dc.SubmitRateLimit, dc.RateLimit); raw != "" {
+		submitAllowUsenet = utils.ParseNonBlockingRateLimit(raw)
 	}
 
 	switch dc.Provider {
@@ -71,7 +82,7 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	case "alldebrid":
 		client, err = alldebrid.New(dc, rateLimits, submitAllow)
 	case "torbox":
-		client, err = torbox.New(dc, rateLimits, submitAllow)
+		client, err = torbox.New(dc, rateLimits, submitAllow, submitAllowUsenet)
 	case "debridlink":
 		client, err = debridlink.New(dc, rateLimits, submitAllow)
 	default:

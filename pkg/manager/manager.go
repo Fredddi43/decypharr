@@ -632,6 +632,56 @@ func (m *Manager) GetTorrentsCount() (int, error) {
 	return m.storage.Count()
 }
 
+// ResearchEntry tells the originating arr to blocklist the grab and
+// trigger a fresh search, then deletes the local entry. Reuses the
+// queue janitor's permanent-rejection path so behaviour matches what
+// happens for "all debrids rejected" today. Returns (blocklisted,
+// dropped) — same semantics as dropPermanentlyRejected.
+func (m *Manager) ResearchEntry(entry *storage.Entry) (bool, bool) {
+	if m.queueJanitor == nil {
+		return false, false
+	}
+	return m.queueJanitor.dropPermanentlyRejected(entry)
+}
+
+// SubmitQuotaInfo is the per-API snapshot served at
+// GET /api/debrids/{name}/quotas. The dashboard renders a radial-progress
+// per (debrid, api) using TokensAvailable / Capacity.
+type SubmitQuotaInfo struct {
+	API             string `json:"api"`              // "torrent" or "usenet"
+	Configured      string `json:"configured"`       // raw config string ("60/hour", etc.)
+	Capacity        int    `json:"capacity"`         // burst size of the bucket
+	TokensAvailable int    `json:"tokens_available"` // current refill state
+}
+
+// SubmitQuotas returns the current submit-bucket state for both APIs on a
+// debrid. The Tokens reading is a snapshot from the limiter; it floats as
+// tokens refill at the configured rate. Returns ErrUnsupportedDebridProvider
+// when no client is configured under that name.
+func (m *Manager) SubmitQuotas(name string) ([]SubmitQuotaInfo, error) {
+	client, ok := m.clients.Load(name)
+	if !ok {
+		return nil, ErrUnsupportedDebridProvider
+	}
+	out := []SubmitQuotaInfo{}
+	cfg := client.Config()
+	out = append(out, SubmitQuotaInfo{
+		API:        "torrent",
+		Configured: cfg.SubmitRateLimit,
+	})
+	if cfg.SupportsUsenet {
+		usenetRaw := cfg.SubmitRateLimitUsenet
+		if usenetRaw == "" {
+			usenetRaw = cfg.SubmitRateLimit
+		}
+		out = append(out, SubmitQuotaInfo{
+			API:        "usenet",
+			Configured: usenetRaw,
+		})
+	}
+	return out, nil
+}
+
 // DeleteEntry deletes a torrent by infohash
 func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	torr, err := m.GetEntry(infohash)

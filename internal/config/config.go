@@ -684,16 +684,27 @@ func (c *Config) setDefaults() {
 	// Load the auth file
 	c.Auth = c.GetAuth()
 
-	// Generate API token if auth is enabled and no token exists
+	// Generate an API token ONLY on first run (auth.json doesn't exist).
+	//
+	// The earlier behaviour was "regenerate if APIToken is empty", which
+	// silently clobbered the saved token whenever auth.json was unreadable
+	// for any reason (transient race, partial write, etc.) and broke
+	// external clients that depended on a stable Bearer. If auth.json
+	// exists but lacks an api_token (e.g. corrupt or hand-edited), the
+	// operator must explicitly hit POST /api/refresh-token to issue a new
+	// one — silent rewrites are out of bounds for a credential file.
 	if c.UseAuth {
 		if c.Auth == nil {
 			c.Auth = &Auth{}
 		}
 		if c.Auth.APIToken == "" {
-			if token, err := generateAPIToken(); err == nil {
-				c.Auth.APIToken = token
-				// Save the updated auth config
-				_ = c.SaveAuth(c.Auth)
+			if _, statErr := os.Stat(c.AuthFile()); os.IsNotExist(statErr) {
+				if token, err := generateAPIToken(); err == nil {
+					c.Auth.APIToken = token
+					_ = c.SaveAuth(c.Auth)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "WARN: %s exists but has no api_token; not auto-regenerating. POST /api/refresh-token to issue one.\n", c.AuthFile())
 			}
 		}
 	}

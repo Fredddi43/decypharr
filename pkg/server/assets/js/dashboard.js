@@ -40,6 +40,8 @@ class TorrentDashboard {
     init() {
         this.bindEvents();
         this.loadTorrents();
+        this.loadPendingQueue();
+        this.loadQuotas();
         this.startAutoRefresh();
     }
 
@@ -496,7 +498,187 @@ class TorrentDashboard {
     startAutoRefresh() {
         setInterval(() => {
             this.loadTorrents();
+            this.loadPendingQueue();
+            this.loadQuotas();
         }, 10000); // Refresh every 10 seconds
+    }
+
+    // === Submission queue ===
+    // Renders the pending-submission panel + quota gauges. Polled on the
+    // same 10s tick as the main torrent table.
+
+    async loadPendingQueue() {
+        try {
+            const resp = await window.decypharrUtils.fetcher(
+                '/api/torrents?limit=200&state=pendingSubmit&sort_by=priority&sort_order=asc'
+            );
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const items = (data && data.torrents) ? data.torrents : [];
+            this.renderPendingQueue(items);
+        } catch (e) {
+            console.error('loadPendingQueue:', e);
+        }
+    }
+
+    renderPendingQueue(items) {
+        const card = document.getElementById('submissionQueueCard');
+        const tbody = document.getElementById('pendingQueueBody');
+        if (!card || !tbody) return;
+
+        // Hide the whole panel when there's nothing pending AND no quotas
+        // configured — keeps the dashboard clean for users who never use
+        // submit-rate-limited providers.
+        if (items.length === 0 && !document.querySelector('#quotaGauges .quota-gauge')) {
+            card.style.display = 'none';
+            return;
+        }
+        card.style.display = '';
+
+        if (items.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center opacity-60">Nothing pending. Quotas free.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = items.map((t) => {
+            const h = this.escapeAttr(t.info_hash);
+            const name = this.escapeHtml(t.name || t.info_hash);
+            const cat = this.escapeHtml(t.category || '');
+            const protocol = this.escapeHtml(t.protocol || '');
+            const prio = t.priority || 0;
+            return `
+                <tr draggable="true" data-hash="${h}" class="pending-row">
+                    <td class="cursor-grab text-center opacity-60"><i class="bi bi-grip-vertical"></i></td>
+                    <td class="truncate max-w-md" title="${name}">${name}</td>
+                    <td>${cat}</td>
+                    <td><span class="badge badge-sm">${protocol}</span></td>
+                    <td class="font-mono text-xs">${prio}</td>
+                    <td class="text-right whitespace-nowrap">
+                        <button class="btn btn-xs btn-ghost" title="Move to top"
+                                onclick="window.dashboard.queueMoveTop('${h}')"><i class="bi bi-arrow-up-square"></i></button>
+                        <button class="btn btn-xs btn-ghost" title="Pause"
+                                onclick="window.dashboard.queuePause('${h}')"><i class="bi bi-pause"></i></button>
+                        <button class="btn btn-xs btn-ghost" title="Cancel"
+                                onclick="window.dashboard.queueCancel('${h}')"><i class="bi bi-x-circle"></i></button>
+                        <button class="btn btn-xs btn-ghost" title="Re-search via arr"
+                                onclick="window.dashboard.queueResearch('${h}')"><i class="bi bi-arrow-repeat"></i></button>
+                    </td>
+                </tr>`;
+        }).join('');
+
+        this.bindPendingDragHandlers(items);
+    }
+
+    bindPendingDragHandlers(items) {
+        const rows = document.querySelectorAll('#pendingQueueBody .pending-row');
+        let dragging = null;
+        rows.forEach((row) => {
+            row.addEventListener('dragstart', () => {
+                dragging = row;
+                row.classList.add('opacity-50');
+            });
+            row.addEventListener('dragend', () => {
+                row.classList.remove('opacity-50');
+                dragging = null;
+            });
+            row.addEventListener('dragover', (e) => e.preventDefault());
+            row.addEventListener('drop', async (e) => {
+                e.preventDefault();
+                if (!dragging || dragging === row) return;
+                const hashes = [...document.querySelectorAll('#pendingQueueBody .pending-row')]
+                    .map((r) => r.getAttribute('data-hash'));
+                const movedHash = dragging.getAttribute('data-hash');
+                const targetHash = row.getAttribute('data-hash');
+                // Compute new priority = average of neighbours so we don't
+                // need to renumber on every reorder. Falls back to existing
+                // priority - 1 when dropped onto position 0.
+                const target = items.find((x) => x.info_hash === targetHash);
+                const prev = items[items.indexOf(target) - 1];
+                const newPrio = prev
+                    ? Math.floor((prev.priority + target.priority) / 2)
+                    : target.priority - 1;
+                await this.patchPriority(movedHash, newPrio);
+                this.loadPendingQueue();
+            });
+        });
+    }
+
+    async patchPriority(hash, priority) {
+        try {
+            const resp = await window.decypharrUtils.fetcher(`/api/torrents/${hash}/priority`, {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({priority}),
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        } catch (e) {
+            window.decypharrUtils.createToast(`Failed to reorder: ${e.message}`, 'error');
+        }
+    }
+
+    async queueAction(hash, path, method = 'POST', body = null) {
+        try {
+            const opts = {method, headers: {'Content-Type': 'application/json'}};
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await window.decypharrUtils.fetcher(`/api/torrents/${hash}/${path}`, opts);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            this.loadPendingQueue();
+            return await resp.json().catch(() => ({}));
+        } catch (e) {
+            window.decypharrUtils.createToast(`${path} failed: ${e.message}`, 'error');
+        }
+    }
+
+    queueMoveTop(hash) {
+        return this.queueAction(hash, 'priority', 'PATCH', {move_to_top: true});
+    }
+    queuePause(hash)    { return this.queueAction(hash, 'pause'); }
+    queueResume(hash)   { return this.queueAction(hash, 'resume'); }
+    queueCancel(hash)   { return this.queueAction(hash, 'cancel'); }
+    queueResearch(hash) { return this.queueAction(hash, 'research'); }
+
+    // === Quota gauges ===
+    // Renders one radial-progress per (debrid, api). The set of debrids
+    // comes from /api/config; the per-debrid quotas come from
+    // /api/debrids/{name}/quotas (one call per debrid). Static metadata
+    // (capacity, configured rate) is enough for a useful gauge — current
+    // token-counter would need a wider provider-API surface to expose.
+
+    async loadQuotas() {
+        try {
+            const resp = await window.decypharrUtils.fetcher('/api/config');
+            if (!resp.ok) return;
+            const cfg = await resp.json();
+            const debrids = (cfg && cfg.debrids) || [];
+            const gauges = document.getElementById('quotaGauges');
+            if (!gauges) return;
+            const results = await Promise.all(debrids.map(async (d) => {
+                if (!d.name) return null;
+                try {
+                    const r = await window.decypharrUtils.fetcher(`/api/debrids/${encodeURIComponent(d.name)}/quotas`);
+                    if (!r.ok) return null;
+                    const arr = await r.json();
+                    return {name: d.name, quotas: arr || []};
+                } catch (_) { return null; }
+            }));
+            const blocks = [];
+            for (const row of results) {
+                if (!row) continue;
+                for (const q of row.quotas) {
+                    if (!q.configured) continue;
+                    blocks.push(`
+                        <div class="quota-gauge badge badge-outline gap-2 px-3 py-3 h-auto">
+                            <i class="bi ${q.api === 'usenet' ? 'bi-newspaper' : 'bi-link-45deg'}"></i>
+                            <span class="font-medium">${this.escapeHtml(row.name)}</span>
+                            <span class="text-xs opacity-70">${this.escapeHtml(q.api)}</span>
+                            <span class="text-xs font-mono">${this.escapeHtml(q.configured)}</span>
+                        </div>`);
+                }
+            }
+            gauges.innerHTML = blocks.join('');
+        } catch (e) {
+            console.error('loadQuotas:', e);
+        }
     }
 
     // Utility methods

@@ -895,26 +895,12 @@ func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
 		auth = &config.Auth{}
 	}
 
-	// Check if trying to disable authentication (both empty)
+	// Auth is mandatory across the installation. The legacy "submit both
+	// fields blank to disable auth" path is no longer honoured — it was
+	// the same foot-gun that left the LAN dashboard wide open after a
+	// careless config save.
 	if req.Username == "" && req.Password == "" {
-		// Disable authentication
-		cfg.UseAuth = false
-		auth.Username = ""
-		auth.Password = ""
-		if err := cfg.SaveAuth(auth); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to save auth config")
-			http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
-			return
-		}
-		if err := cfg.Save(); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to save config")
-			http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
-			return
-		}
-
-		utils.JSONResponse(w, map[string]string{
-			"message": "Authentication disabled successfully",
-		}, http.StatusOK)
+		http.Error(w, "auth is mandatory; cannot disable", http.StatusForbidden)
 		return
 	}
 

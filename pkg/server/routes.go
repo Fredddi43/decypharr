@@ -70,6 +70,16 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)
 			r.Delete("/torrents", s.handleDeleteTorrents) // Fixed trailing slash
 
+			// Pending-submission queue actions
+			r.Patch("/torrents/{hash}/priority", s.handleTorrentPriority)
+			r.Post("/torrents/{hash}/pause", s.handleTorrentPause)
+			r.Post("/torrents/{hash}/resume", s.handleTorrentResume)
+			r.Post("/torrents/{hash}/cancel", s.handleTorrentCancel)
+			r.Post("/torrents/{hash}/research", s.handleTorrentResearch)
+
+			// Per-debrid submit-quota introspection (UI gauges)
+			r.Get("/debrids/{name}/quotas", s.handleDebridQuotas)
+
 			// Browse - WebDAV-style hierarchical file browser
 			r.Route("/browse", func(r chi.Router) {
 				// Hierarchical browse endpoints

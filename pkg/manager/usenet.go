@@ -73,17 +73,20 @@ func (m *Manager) addNZBViaDebrid(ctx context.Context, req *ImportRequest) (stri
 		Category:         req.Arr.Name,
 		SavePath:         filepath.Join(req.DownloadFolder, req.Arr.Name),
 		Status:           debridTypes.TorrentStatusDownloading,
-		State:            storage.EntryStateDownloading,
-		Progress:         0,
-		Action:           req.Action,
-		CallbackURL:      req.CallBackUrl,
-		SkipMultiSeason:  req.SkipMultiSeason,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		AddedOn:          now,
-		Providers:        make(map[string]*storage.ProviderEntry),
-		Files:            make(map[string]*storage.File),
-		Tags:             []string{},
+		// PendingSubmit — same lifecycle as the torrent path. Flips to
+		// Downloading when SubmitNZB succeeds.
+		State:           storage.EntryStatePendingSubmit,
+		Priority:        now.UnixNano(),
+		Progress:        0,
+		Action:          req.Action,
+		CallbackURL:     req.CallBackUrl,
+		SkipMultiSeason: req.SkipMultiSeason,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		AddedOn:         now,
+		Providers:       make(map[string]*storage.ProviderEntry),
+		Files:           make(map[string]*storage.File),
+		Tags:            []string{},
 	}
 	entry.ContentPath = entry.DownloadPath()
 	if err := m.queue.Add(entry); err != nil {
@@ -102,6 +105,7 @@ func (m *Manager) addNZBViaDebrid(ctx context.Context, req *ImportRequest) (stri
 func (m *Manager) submitNewNZBAsync(ctx context.Context, importReq *ImportRequest, entry *storage.Entry) {
 	debridTorrent, err := m.SendNZBToDebrid(ctx, importReq)
 	if err == nil {
+		entry.State = storage.EntryStateDownloading
 		entry.DownloadUncached = debridTorrent.DownloadUncached
 		_ = m.queue.Update(entry)
 		m.processNewTorrent(entry, debridTorrent)

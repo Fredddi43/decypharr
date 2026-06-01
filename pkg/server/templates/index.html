@@ -13,6 +13,39 @@
     </div>
     {{ end }}
 
+    <!-- Submission queue: rendered when there's pending work or when at
+         least one debrid has a configured submit rate limit so the gauge
+         is meaningful. Pending rows are draggable; drop reorders the
+         submission position via PATCH /priority. -->
+    <div class="card bg-base-100 shadow-xl" id="submissionQueueCard" style="display:none">
+        <div class="card-body">
+            <div class="flex items-center justify-between gap-4 flex-wrap">
+                <h2 class="card-title">Submission queue</h2>
+                <div id="quotaGauges" class="flex flex-wrap gap-3"></div>
+            </div>
+            <div class="text-sm opacity-70">
+                Items waiting to be sent to a debrid. Drag rows to reorder; the top-most pending item is submitted whenever its provider's rate-limit bucket frees a slot.
+            </div>
+            <div class="overflow-x-auto">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th class="w-8"></th>
+                            <th>Name</th>
+                            <th>Arr</th>
+                            <th>Protocol</th>
+                            <th>Priority</th>
+                            <th class="text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pendingQueueBody">
+                        <tr><td colspan="6" class="text-center opacity-60">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <div class="card bg-base-100 shadow-xl">
         <div class="card-body">
             <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
@@ -40,6 +73,7 @@
                     <div>
                         <select class="select select-sm" id="stateFilter">
                             <option value="">All States</option>
+                            <option value="pendingSubmit">Pending Submit</option>
                             <option value="pausedUP">Completed</option>
                             <option value="downloading">Downloading</option>
                             <option value="error">Error</option>

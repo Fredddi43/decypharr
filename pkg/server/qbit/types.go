@@ -415,6 +415,14 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 		completionOn = t.CreatedAt.Unix()
 	}
 
+	// qbit doesn't know our internal "pendingSubmit" state — Sonarr/Radarr
+	// would treat an unknown state as suspicious. Surface it as
+	// "queuedDL" (a real qbit state) so the arr keeps tracking the grab
+	// while decypharr's submission queue is still working through it.
+	qbState := t.State
+	if qbState == storage.EntryStatePendingSubmit {
+		qbState = "queuedDL"
+	}
 	qbitTorrent := Torrent{
 		Hash:         t.InfoHash,
 		Name:         t.Name,
@@ -423,7 +431,7 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 		Dlspeed:      t.Speed,
 		Eta:          int64(0), // ETA not tracked
 		NumSeeds:     t.Seeders,
-		State:        t.State,
+		State:        qbState,
 		Category:     t.Category,
 		SavePath:     t.SavePath,
 		ContentPath:  t.ContentPath,

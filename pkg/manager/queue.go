@@ -296,6 +296,14 @@ func (q *Queue) ListFilter(category string, protocol config.Protocol, state stor
 				return torrents[i].Category < torrents[j].Category
 			case "seeders":
 				return torrents[i].Seeders < torrents[j].Seeders
+			case "priority":
+				// Priority ASC, then CreatedAt ASC as tiebreaker. Smaller
+				// priority = earlier submission slot. Used by the pending
+				// queue UI + the submission drainer.
+				if torrents[i].Priority != torrents[j].Priority {
+					return torrents[i].Priority < torrents[j].Priority
+				}
+				return torrents[i].CreatedAt.Before(torrents[j].CreatedAt)
 			default:
 				// Default sort by added_on
 				return torrents[i].AddedOn.Before(torrents[j].AddedOn)
@@ -307,6 +315,28 @@ func (q *Queue) ListFilter(category string, protocol config.Protocol, state stor
 
 func (q *Queue) UpdateWhere(predicate func(*storage.Entry) bool, updateFunc func(*storage.Entry) bool) error {
 	return q.storage.UpdateWhereQueued(predicate, updateFunc)
+}
+
+// ListPending returns queue entries in EntryStatePendingSubmit, ordered
+// by Priority ASC + CreatedAt ASC. Used by the dashboard's pending panel
+// + the actions API. Pass empty category/protocol to match all.
+func (q *Queue) ListPending(category string, protocol config.Protocol) []*storage.Entry {
+	return q.ListFilter(category, protocol, storage.EntryStatePendingSubmit, nil, "priority", false)
+}
+
+// Reorder sets a new Priority on the entry identified by hash. Lower
+// priority sorts earlier in the drain. The dashboard's "move to top"
+// action passes priority = min(existing pending priorities) - 1; freeform
+// drops pass the average of the two neighbours so re-numbering isn't
+// needed.
+func (q *Queue) Reorder(hash string, newPriority int64) error {
+	entry, err := q.GetTorrent(hash)
+	if err != nil {
+		return fmt.Errorf("entry not found: %w", err)
+	}
+	entry.Priority = newPriority
+	entry.UpdatedAt = time.Now()
+	return q.Update(entry)
 }
 
 func (q *Queue) PushRequest(req *ImportRequest) error {

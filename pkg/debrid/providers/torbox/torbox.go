@@ -46,6 +46,7 @@ type Torbox struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	submitClient          *request.Client // for /api/torrents/createtorrent — separate rate-limit bucket; no 429 retry so fast-fail lets SendToDebrid fallback to the next provider
+	submitClientUsenet    *request.Client // for /api/usenet/createusenetdownload — independent bucket from submitClient since TorBox may or may not share the quota server-side
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -54,7 +55,7 @@ type Torbox struct {
 	downloadPresentLoaded bool
 }
 
-func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow *rate.Limiter) (*Torbox, error) {
+func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow, submitAllowUsenet *rate.Limiter) (*Torbox, error) {
 	cfg := config.Get()
 	headers := map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", dc.APIKey),
@@ -101,6 +102,21 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		submitOpts = append(submitOpts, request.WithProxy(dc.Proxy))
 	}
 
+	// Usenet submit client mirrors the torrent submit client config but
+	// uses its own non-blocking rate-limit bucket so a saturated
+	// torrent-submit quota doesn't block usenet submissions and vice
+	// versa. Fast-fail semantics identical to submitClient.
+	submitUsenetOpts := []request.ClientOption{
+		request.WithHeaders(headers),
+		request.WithMaxRetries(1),
+	}
+	if submitAllowUsenet != nil {
+		submitUsenetOpts = append(submitUsenetOpts, request.WithNonBlockingRateLimit(submitAllowUsenet))
+	}
+	if dc.Proxy != "" {
+		submitUsenetOpts = append(submitUsenetOpts, request.WithProxy(dc.Proxy))
+	}
+
 	autoExpiresLinksAfter, err := utils.ParseDuration(dc.AutoExpireLinksAfter)
 	if autoExpiresLinksAfter == 0 || err != nil {
 		autoExpiresLinksAfter = 48 * time.Hour
@@ -114,6 +130,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
 		submitClient:          request.New(submitOpts...),
+		submitClientUsenet:    request.New(submitUsenetOpts...),
 		logger:                _log,
 	}
 	return tb, nil
@@ -1007,7 +1024,12 @@ func (tb *Torbox) doSubmitPostMultipart(endpoint, fileFieldName, fileName string
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	resp, err := tb.submitClient.Do(req)
+	// Route through the usenet-specific submit client (independent
+	// non-blocking rate-limit bucket) since this helper is currently
+	// only used for /api/usenet/createusenetdownload. If a future call
+	// site needs the torrent submit bucket, accept the client as a
+	// parameter — keep this default as the usenet path.
+	resp, err := tb.submitClientUsenet.Do(req)
 	if err != nil {
 		return nil, err
 	}

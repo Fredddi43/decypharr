@@ -120,7 +120,11 @@ func filterByQBitState(entries []*storage.Entry, filter string) []*storage.Entry
 	case "downloading":
 		matches = func(e *storage.Entry) bool {
 			s := string(e.State)
-			return s == "downloading" || s == "stalledDL" || s == "queuedDL" || s == "metaDL" || s == "forcedDL" || s == "pausedDL"
+			// pendingSubmit is decypharr's internal "waiting to be sent to
+			// debrid" state — the arr's perspective is still "in-flight",
+			// so report it under the "downloading" filter so Sonarr/Radarr
+			// keep tracking it instead of dropping the grab.
+			return s == "downloading" || s == "stalledDL" || s == "queuedDL" || s == "metaDL" || s == "forcedDL" || s == "pausedDL" || s == "pendingSubmit"
 		}
 	case "seeding", "completed", "uploading":
 		matches = func(e *storage.Entry) bool {

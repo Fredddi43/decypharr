@@ -363,6 +363,21 @@ class ConfigManager {
             });
         }
 
+        // Toggle TorBox-only fields (submit_rate_limit_usenet,
+        // supports_usenet) based on the provider select. Initialise to
+        // the current value + re-evaluate on every change.
+        const providerSelect = newDebrid.querySelector(`[name="debrid[${this.debridCount}].provider"]`);
+        const toggleTorboxOnly = () => {
+            const isTorbox = providerSelect && providerSelect.value === 'torbox';
+            newDebrid.querySelectorAll('[data-torbox-only]').forEach(el => {
+                el.style.display = isTorbox ? '' : 'none';
+            });
+        };
+        if (providerSelect) {
+            providerSelect.addEventListener('change', toggleTorboxOnly);
+            toggleTorboxOnly();
+        }
+
         // Populate data if provided
         if (Object.keys(data).length > 0) {
             this.populateDebridData(this.debridCount, data);
@@ -512,12 +527,29 @@ class ConfigManager {
                             </div>
                             <div>
                                 <label class="label" for="debrid[${index}].submit_rate_limit">
-                                    <span class=" font-medium">Submit Rate Limit</span>
+                                    <span class=" font-medium">Submit Rate Limit (torrent)</span>
                                 </label>
                                 <input type="text" class="input w-full"
                                        name="debrid[${index}].submit_rate_limit" id="debrid[${index}].submit_rate_limit"
                                        placeholder="60/hour (TorBox createtorrent quota)">
-                                <span class="text-sm opacity-70">API rate limit for torrent submission (createtorrent / addMagnet). Set to <code>60/hour</code> for TorBox to avoid HTTP 429. Falls back to the general Rate Limit when empty.</span>
+                                <span class="text-sm opacity-70">Per-bucket rate limit for the torrent submit endpoint (createtorrent / addMagnet). Set to <code>60/hour</code> for TorBox. Falls back to the general Rate Limit when empty.</span>
+                            </div>
+                            <div data-torbox-only style="display:none">
+                                <label class="label" for="debrid[${index}].submit_rate_limit_usenet">
+                                    <span class=" font-medium">Submit Rate Limit (Usenet)</span>
+                                </label>
+                                <input type="text" class="input w-full"
+                                       name="debrid[${index}].submit_rate_limit_usenet" id="debrid[${index}].submit_rate_limit_usenet"
+                                       placeholder="60/hour (TorBox createusenetdownload quota)">
+                                <span class="text-sm opacity-70">Separate bucket for the Usenet submit endpoint (<code>/api/usenet/createusenetdownload</code>). Falls back to the torrent Submit Rate Limit when empty. TorBox may or may not share the quota with the torrent endpoint — split them so we don't waste quota if they're independent.</span>
+                            </div>
+                            <div data-torbox-only style="display:none">
+                                <label class="label cursor-pointer flex items-center gap-2" for="debrid[${index}].supports_usenet">
+                                    <input type="checkbox" class="checkbox"
+                                           name="debrid[${index}].supports_usenet" id="debrid[${index}].supports_usenet">
+                                    <span class="font-medium">Route NZBs through this provider (Usenet API)</span>
+                                </label>
+                                <span class="text-sm opacity-70">When enabled, NZBs grabbed by Sonarr/Radarr via decypharr's SABnzbd-compat endpoint are submitted to TorBox's <code>/api/usenet/*</code> API instead of decypharr's direct-NNTP path. TorBox-only — provides a complete NZB pipeline without needing a separate NNTP provider.</span>
                             </div>
                             <div>
                                 <label class="label" for="debrid[${index}].download_api_key_auto_heal" class="flex items-center gap-2 cursor-pointer">
@@ -1348,6 +1380,14 @@ class ConfigManager {
             };
             if (submitRateLimitInput && submitRateLimitInput.value) {
                 debrid.submit_rate_limit = submitRateLimitInput.value;
+            }
+            const submitRateLimitUsenetInput = getField('submit_rate_limit_usenet');
+            if (submitRateLimitUsenetInput && submitRateLimitUsenetInput.value) {
+                debrid.submit_rate_limit_usenet = submitRateLimitUsenetInput.value;
+            }
+            const supportsUsenetInput = getField('supports_usenet');
+            if (supportsUsenetInput) {
+                debrid.supports_usenet = supportsUsenetInput.checked;
             }
             if (downloadKeyAutoHealInput) {
                 debrid.download_api_key_auto_heal = downloadKeyAutoHealInput.checked;
