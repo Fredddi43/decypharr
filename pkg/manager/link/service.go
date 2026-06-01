@@ -459,7 +459,11 @@ func (s *Service) validateLink(ctx context.Context, link *types.DownloadLink) er
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return NewRetryableError(
+		// Transport-level failure (timeout, connection refused, DNS): the host
+		// this cached link points at is unreachable — e.g. the old CDN edge
+		// after a region switch. Refetch a fresh link instead of retrying the
+		// dead URL, so the link self-heals on the next read without a restart.
+		return NewRefetchableError(
 			fmt.Errorf("HEAD request failed: %w", err),
 			"network_error",
 		)

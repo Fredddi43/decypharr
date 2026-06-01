@@ -3,6 +3,7 @@ package link
 import (
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // ErrorCategory defines the type of link error and its retry behavior
@@ -128,6 +129,15 @@ func NewAccountError(err error, code string) *Error {
 
 // ErrorCodeToLinkError converts an error code string to a LinkError with appropriate category
 func ErrorCodeToLinkError(code string) *Error {
+	// HTTP 5xx (incl. Cloudflare 52x): the download host / CDN edge this issued
+	// URL points at is failing. A freshly issued link can route to a healthy
+	// edge — notably after a CDN-region switch — so treat any server-side
+	// failure as refetchable. This lets a broken cached link self-heal on the
+	// next read instead of wedging until decypharr is restarted.
+	if n, convErr := strconv.Atoi(code); convErr == nil && n >= 500 && n <= 599 {
+		return NewRefetchableError(fmt.Errorf("HTTP %s from download host", code), code)
+	}
+
 	switch code {
 	case "link_not_found":
 		return NewPermanentError(ErrLinkNotFound, code)
@@ -145,8 +155,6 @@ func ErrorCodeToLinkError(code string) *Error {
 		return NewPermanentError(Err404, code)
 	case "429":
 		return NewRetryableError(Err429, code)
-	case "503":
-		return NewRetryableError(Err503, code)
 	default:
 		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
 	}

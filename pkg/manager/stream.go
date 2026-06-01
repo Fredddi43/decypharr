@@ -217,13 +217,18 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 	// stream — which used to wedge the file for ~65min (until the next
 	// scheduled refresh). Detect that case here, force-refresh the URL via
 	// the debrid API, and retry once before bubbling EIO up to FUSE.
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+	//
+	// 5xx is treated the same way: a server-side/CDN-edge failure on the issued
+	// URL (notably the stale edge left behind after a CDN-region switch) means a
+	// freshly issued link can route to a healthy edge. Refresh + retry once so
+	// the cached link self-heals mid-playback instead of stopping the stream.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone || resp.StatusCode >= 500 {
 		expiredStatus := resp.StatusCode
 		resp.Body.Close()
 		m.logger.Warn().
 			Str("filename", filename).
 			Int("status", expiredStatus).
-			Msg("Stream URL appears expired; refreshing from debrid and retrying once")
+			Msg("Stream URL expired or CDN error; refreshing from debrid and retrying once")
 		freshLink, refreshErr := m.linkService.RefreshLink(ctx, torrent, downloadLink)
 		if refreshErr != nil {
 			return retry.Unrecoverable(StreamError{
