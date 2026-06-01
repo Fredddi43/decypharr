@@ -29,14 +29,19 @@ func getMode(ctx context.Context) string {
 
 func (s *SABnzbd) categoryContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		category := r.URL.Query().Get("category")
+		// Real Sonarr/Radarr always send `cat=<name>`; the longer
+		// `category=` form is rarer but supported. Try both, query
+		// string first then form body (NZB-file POSTs).
+		category := r.URL.Query().Get("cat")
 		if category == "" {
-			// Check form data
-			_ = r.ParseForm()
-			category = r.Form.Get("category")
+			category = r.URL.Query().Get("category")
 		}
 		if category == "" {
-			category = r.FormValue("category")
+			_ = r.ParseForm()
+			category = r.Form.Get("cat")
+			if category == "" {
+				category = r.Form.Get("category")
+			}
 		}
 
 		ctx := context.WithValue(r.Context(), categoryKey, strings.TrimSpace(category))
