@@ -867,6 +867,83 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 	return nil, fmt.Errorf("failed to process torrent: %w", joinedErrors)
 }
 
+// SendNZBToDebrid submits an NZB to the first configured debrid that
+// implements UsenetClient with SupportsUsenet=true (currently only TorBox
+// via /api/usenet/createusenetdownload). Mirrors SendToDebrid's
+// per-provider cooldown + rate-limit-aware fan-out, but skips magnet/
+// torrent-only debrids so RealDebrid/AllDebrid don't get walked
+// pointlessly. Returns a *debridTypes.Torrent with Protocol=ProtocolNZB
+// suitable for the existing processNewTorrent post-submit flow.
+//
+// The privacy gate: if no debrid satisfies UsenetClient+SupportsUsenet,
+// this function returns an error rather than falling through to NNTP.
+// AddNewNZB is responsible for the higher-level NNTP fallback decision.
+func (m *Manager) SendNZBToDebrid(ctx context.Context, importRequest *ImportRequest) (*debridTypes.Torrent, error) {
+	debridTorrent := &debridTypes.Torrent{
+		Name:             importRequest.Name,
+		OriginalFilename: importRequest.Name,
+		Arr:              importRequest.Arr,
+		Protocol:         debridTypes.ProtocolNZB,
+		Files:            make(map[string]debridTypes.File),
+	}
+
+	all := m.FilterDebrid(func(c common.Client) bool {
+		uc, ok := c.(common.UsenetClient)
+		return ok && uc.SupportsUsenet()
+	})
+	clients := orderDebridClientsBySelection(all, importRequest.SelectedDebrid)
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("no usenet-capable debrid clients available")
+	}
+
+	errs := make([]error, 0, len(clients))
+	for _, db := range clients {
+		if rem := m.providerSubmitCooldownRemaining(db.Config().Name); rem > 0 {
+			errs = append(errs, fmt.Errorf("%s: %w (cooldown %s)", db.Config().Name, customerror.RateLimitedError, rem.Truncate(time.Second)))
+			continue
+		}
+
+		overrideDownloadUncached := false
+		if importRequest.DownloadUncached != nil {
+			overrideDownloadUncached = *importRequest.DownloadUncached
+		} else {
+			overrideDownloadUncached = db.Config().DownloadUncached
+		}
+		debridTorrent.DownloadUncached = overrideDownloadUncached
+
+		_logger := db.Logger()
+		_logger.Info().
+			Str("Provider", db.Config().Name).
+			Str("Arr", importRequest.Arr.Name).
+			Str("Name", debridTorrent.Name).
+			Str("Action", string(importRequest.Action)).
+			Msg("Processing NZB")
+
+		uc := db.(common.UsenetClient) // safe: filtered above
+		dbt, err := uc.SubmitNZB(importRequest.NZBContent, importRequest.Name, overrideDownloadUncached)
+		if err != nil || dbt == nil || dbt.Id == "" {
+			reason := err
+			if reason == nil {
+				reason = fmt.Errorf("no usenet download id returned")
+			}
+			if errors.Is(reason, customerror.RateLimitedError) {
+				m.markProviderSubmitCooldown(db.Config().Name, providerCooldownDur)
+			}
+			_logger.Warn().Err(reason).Str("Provider", db.Config().Name).Str("Name", debridTorrent.Name).Msg("SubmitNZB failed; trying next debrid")
+			errs = append(errs, fmt.Errorf("%s: %w", db.Config().Name, reason))
+			continue
+		}
+		dbt.Arr = importRequest.Arr
+		dbt.Protocol = debridTypes.ProtocolNZB
+		_logger.Info().Str("id", dbt.Id).Msgf("NZB: %s submitted to %s", dbt.Name, db.Config().Name)
+		return dbt, nil
+	}
+	if len(errs) == 0 {
+		return nil, fmt.Errorf("failed to process nzb: no clients available")
+	}
+	return nil, fmt.Errorf("failed to process nzb: %w", errors.Join(errs...))
+}
+
 // orderDebridClientsBySelection returns clients with the named one (if any)
 // moved to index 0 while preserving the relative order of the rest. If
 // selected is empty or no match is found, the input slice is returned

@@ -545,12 +545,21 @@ func isInfohashLike(s string) bool {
 	return true
 }
 
-// processDownload downloads all files for an entry with progress tracking
-// For torrents: uses HTTP download from debrid
-// For NZBs: uses parallel NNTP segment download
+// processDownload downloads all files for an entry with progress tracking.
+//
+// Routing:
+//   - NZB entries with ActiveProvider="usenet" use the direct-NNTP segment
+//     fetcher in processUsenetDownload.
+//   - NZB entries with any other ActiveProvider (e.g. ActiveProvider="TorBox")
+//     came from a debrid Usenet API (TorBox /api/usenet/*) and download via
+//     the same HTTP path as torrents — the debrid serves the assembled files.
+//   - Torrent entries always go through the HTTP path.
+//
+// The ActiveProvider branch is the load-bearing privacy gate at this layer:
+// without it, every NZB entry would fall through to the NNTP fetcher, even
+// when the user has no NNTP provider configured.
 func (d *Downloader) processDownload(entry *storage.Entry) error {
-	// Check if this is a usenet entry
-	if entry.IsNZB() {
+	if entry.IsNZB() && entry.ActiveProvider == "usenet" {
 		return d.processUsenetDownload(entry)
 	}
 	return d.processTorrentDownload(entry)
@@ -635,8 +644,22 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry) error {
 	return nil
 }
 
-// processUsenetDownload downloads NZB files via parallel NNTP segment fetching
+// processUsenetDownload downloads NZB files via parallel NNTP segment
+// fetching. This is the direct-NNTP code path — opens TCP sockets to the
+// configured news server and pulls article segments locally.
+//
+// Guard: this function MUST NEVER run for an entry whose ActiveProvider
+// is anything other than "usenet". TorBox/debrid-routed NZBs use
+// ActiveProvider=<debrid name> and download via processTorrentDownload's
+// HTTP path. The check is a belt-and-suspenders backstop to the
+// dispatch-site branch in processDownload — without it, an NZB entry
+// that arrived through TorBox could accidentally trigger NNTP traffic if
+// any future refactor weakens that branch. See the package doc in
+// pkg/usenet/usenet.go for the full privacy invariant.
 func (d *Downloader) processUsenetDownload(entry *storage.Entry) error {
+	if entry.ActiveProvider != "" && entry.ActiveProvider != "usenet" {
+		return fmt.Errorf("processUsenetDownload called for non-NNTP entry %s (active_provider=%s) — refusing to open NNTP socket", entry.Name, entry.ActiveProvider)
+	}
 	if d.manager.usenet == nil {
 		return fmt.Errorf("usenet client not configured")
 	}

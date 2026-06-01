@@ -30,3 +30,24 @@ type Client interface {
 	SpeedTest(ctx context.Context) types.SpeedTestResult
 	SupportsCheck() bool
 }
+
+// UsenetClient is an optional capability interface implemented by debrid
+// clients that accept NZB uploads to their server-side Usenet downloader
+// (currently only TorBox via /api/usenet/*). Separate from the main
+// Client interface so providers without a Usenet feature don't need
+// to stub no-op methods.
+//
+// Manager dispatch type-asserts this interface and checks SupportsUsenet()
+// at runtime. When no client satisfies the assertion AND the user has not
+// configured any direct-NNTP providers in config.Usenet.Providers, NZB
+// submissions are rejected — the pkg/usenet/* NNTP code path stays
+// unreachable. This is the privacy guarantee for users who do not want
+// any NNTP traffic.
+type UsenetClient interface {
+	SupportsUsenet() bool
+	SubmitNZB(nzbContent []byte, name string, downloadUncached bool) (*types.Torrent, error)
+	GetUsenetDownload(id string) (*types.Torrent, error)
+	UpdateUsenetDownload(t *types.Torrent) error
+	GetUsenetDownloadLink(id string, file *types.File) (types.DownloadLink, error)
+	DeleteUsenetDownload(id string) error
+}

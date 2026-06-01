@@ -8,29 +8,152 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
-// AddNewNZB processes an NZB file and stores it as a storage.Entry
+// AddNewNZB processes an NZB submission and routes it to the right backend.
+//
+// Routing order (a single hit short-circuits the rest):
+//  1. Any debrid implementing common.UsenetClient with SupportsUsenet()=true
+//     (currently only TorBox via /api/usenet/*). NZB bytes are POSTed to the
+//     debrid, the entry is stored with Protocol=NZB + ActiveProvider=<debrid>,
+//     and the existing post-submit flow (UpdateUsenetDownload polling + FUSE
+//     serving) handles the rest. This path NEVER touches NNTP.
+//  2. m.usenet != nil — the direct-NNTP path (parses the NZB locally, fetches
+//     articles from a configured news server). Only reachable when
+//     config.Usenet.Providers is populated.
+//  3. Nothing → reject with "usenet not configured".
+//
+// Privacy guarantee: when a user has no NNTP providers configured AND
+// SupportsUsenet=true on TorBox, branch (1) handles every NZB and branch (2)
+// is unreachable. See pkg/usenet/usenet.go and internal/nntp/client.go for
+// the lower-layer guards.
 func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, error) {
-	if m.usenet == nil {
-		return "", fmt.Errorf("usenet not configured")
+	// Branch 1: prefer a Usenet-capable debrid.
+	if usenetCapable := m.FilterDebrid(func(c common.Client) bool {
+		uc, ok := c.(common.UsenetClient)
+		return ok && uc.SupportsUsenet()
+	}); len(usenetCapable) > 0 {
+		return m.addNZBViaDebrid(ctx, req)
 	}
 
+	// Branch 2: direct-NNTP path.
+	if m.usenet != nil {
+		return m.addNZBViaNNTP(ctx, req)
+	}
+
+	// Branch 3: nothing configured.
+	return "", fmt.Errorf("usenet not configured")
+}
+
+// addNZBViaDebrid routes the NZB through the configured Usenet-capable
+// debrid (TorBox). Mirrors submitNewTorrentAsync — the qBit-compat HTTP
+// caller returns fast, the submission + status sync runs in the background.
+func (m *Manager) addNZBViaDebrid(ctx context.Context, req *ImportRequest) (string, error) {
+	m.logger.Info().
+		Str("name", req.Name).
+		Str("category", req.Arr.Name).
+		Msg("Adding new NZB via debrid (Usenet API)")
+
+	// Use the file name as the entry's id/infohash — TorBox returns its own
+	// numeric usenetdownload_id on submit but the queue keys entries by the
+	// SABnzbd-side id, and the file name is the only deterministic value we
+	// have at this point. The TorBox id is stored on the ProviderEntry once
+	// SubmitNZB returns.
+	now := time.Now()
+	entry := &storage.Entry{
+		InfoHash:         req.Name,
+		Name:             req.Name,
+		OriginalFilename: req.Name,
+		Protocol:         config.ProtocolNZB,
+		Category:         req.Arr.Name,
+		SavePath:         filepath.Join(req.DownloadFolder, req.Arr.Name),
+		Status:           debridTypes.TorrentStatusDownloading,
+		State:            storage.EntryStateDownloading,
+		Progress:         0,
+		Action:           req.Action,
+		CallbackURL:      req.CallBackUrl,
+		SkipMultiSeason:  req.SkipMultiSeason,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		AddedOn:          now,
+		Providers:        make(map[string]*storage.ProviderEntry),
+		Files:            make(map[string]*storage.File),
+		Tags:             []string{},
+	}
+	entry.ContentPath = entry.DownloadPath()
+	if err := m.queue.Add(entry); err != nil {
+		return "", fmt.Errorf("failed to add nzb to queue: %w", err)
+	}
+
+	go m.submitNewNZBAsync(context.Background(), req, entry)
+
+	return entry.InfoHash, nil
+}
+
+// submitNewNZBAsync runs SendNZBToDebrid + processNewTorrent in the
+// background. Mirrors submitNewTorrentAsync's error classification —
+// rate-limit errors get a delayed retry; permanent failures transition
+// the entry to state=error so the arr can blocklist + re-search.
+func (m *Manager) submitNewNZBAsync(ctx context.Context, importReq *ImportRequest, entry *storage.Entry) {
+	debridTorrent, err := m.SendNZBToDebrid(ctx, importReq)
+	if err == nil {
+		entry.DownloadUncached = debridTorrent.DownloadUncached
+		_ = m.queue.Update(entry)
+		m.processNewTorrent(entry, debridTorrent)
+		return
+	}
+
+	if errors.Is(err, customerror.RateLimitedError) {
+		m.logger.Warn().Err(err).Str("name", entry.Name).Msg("All usenet-capable debrids rate-limited — entry stays queued, scheduling retry")
+		entry.State = storage.EntryStateDownloading
+		entry.IsDownloading = false
+		if !hasTag(entry.Tags, "submission-rate-limited") {
+			entry.Tags = append(entry.Tags, "submission-rate-limited")
+		}
+		_ = m.queue.Update(entry)
+		go m.retryRateLimitedSubmit(ctx, importReq, entry, 1)
+		return
+	}
+
+	m.logger.Warn().Err(err).Str("name", entry.Name).Msg("NZB submission to debrid failed — transitioning to state=error so the arr can blocklist + re-search")
+	entry.MarkAsError(err)
+	entry.Status = debridTypes.TorrentStatusError
+	if entry.LastErrorTime == nil {
+		now := time.Now()
+		entry.LastErrorTime = &now
+	}
+	entry.Tags = append(entry.Tags, "submission-rejected")
+	_ = m.queue.Update(entry)
+
+	if m.queueJanitor != nil && !isTransientErrorReason(err.Error()) {
+		bl, dr := m.queueJanitor.dropPermanentlyRejected(entry)
+		if dr {
+			m.logger.Info().
+				Str("name", truncate(entry.Name, 80)).
+				Bool("blocklisted_in_arr", bl).
+				Msg("Eagerly dropped permanently-rejected NZB entry")
+		}
+	}
+}
+
+// addNZBViaNNTP is the legacy direct-NNTP path. Only reachable when
+// config.Usenet.Providers is configured (i.e. m.usenet != nil).
+func (m *Manager) addNZBViaNNTP(ctx context.Context, req *ImportRequest) (string, error) {
 	m.logger.Info().
 		Str("name", req.Name).
 		Str("category", req.Arr.Name).
 		Msg("Adding new NZB to usenet")
 
-	// Parse NZB through usenet client
 	meta, groups, err := m.usenet.Parse(ctx, req.Name, req.NZBContent, req.Arr.Name)
 	if err != nil {
 		return "", fmt.Errorf("usenet process failed: %w", err)
 	}
 
-	// Create storage.Entry
 	entry := &storage.Entry{
 		InfoHash:         meta.ID,
 		Name:             meta.Name,
@@ -64,7 +187,6 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		return "", fmt.Errorf("failed to add nzb to queue: %w", err)
 	}
 
-	// Submit job to unbounded worker pool queue (never blocks)
 	m.nzbQueue.Push(&nzbJob{entry: entry, meta: meta, groups: groups})
 	m.logger.Debug().Str("name", entry.Name).Int("queued", m.nzbQueue.Len()).Msg("NZB added to processing queue")
 

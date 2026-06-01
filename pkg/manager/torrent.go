@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -424,8 +425,26 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 	if needsUpdate {
 		// This is the main bottleneck - API call per torrent
 		// Consider: Could we batch UpdateTorrent calls? Depends on debrid API
-		if err := client.UpdateTorrent(t); err != nil {
-			return nil, err
+		//
+		// For NZB entries (t.Protocol == "nzb"), dispatch to the
+		// usenet-specific status endpoint on providers that implement
+		// UsenetClient. TorBox's /api/usenet/mylist returns different
+		// fields than /api/torrents/mylist; calling the torrent path
+		// for a usenet ID returns 404. Falls back to standard
+		// UpdateTorrent if the provider doesn't implement UsenetClient
+		// or the entry isn't NZB.
+		var updateErr error
+		if t.IsNZB() {
+			if uc, ok := client.(debrid.UsenetClient); ok && uc.SupportsUsenet() {
+				updateErr = uc.UpdateUsenetDownload(t)
+			} else {
+				return nil, fmt.Errorf("NZB sync for %s: provider %s does not support usenet", t.InfoHash, t.Debrid)
+			}
+		} else {
+			updateErr = client.UpdateTorrent(t)
+		}
+		if updateErr != nil {
+			return nil, updateErr
 		}
 
 		// Re-check completion after update

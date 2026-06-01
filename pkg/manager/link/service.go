@@ -324,8 +324,29 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 		Deleted:   file.Deleted,
 	}
 
-	// This uses account-level caching internally
-	downloadLink, err := client.GetDownloadLink(placement.ID, debridFile)
+	// This uses account-level caching internally.
+	//
+	// For NZB entries (entry.Protocol == "nzb"), dispatch to the
+	// usenet-specific download-link path on providers that implement
+	// UsenetClient. TorBox's /api/usenet/requestdl uses param name
+	// `usenet_id` instead of `torrent_id`, and the endpoint URL
+	// differs — calling the torrent path on a usenet ID returns 404.
+	// Falls back to the standard torrent GetDownloadLink for any
+	// non-NZB entry or any provider that doesn't implement
+	// UsenetClient.
+	var downloadLink types.DownloadLink
+	if entry.IsNZB() {
+		if uc, ok := client.(debrid.UsenetClient); ok && uc.SupportsUsenet() {
+			downloadLink, err = uc.GetUsenetDownloadLink(placement.ID, debridFile)
+		} else {
+			return emptyDownloadLink, NewPermanentError(
+				fmt.Errorf("entry %s is NZB but provider %s does not support usenet", entry.GetFolder(), entry.ActiveProvider),
+				"usenet_unsupported",
+			)
+		}
+	} else {
+		downloadLink, err = client.GetDownloadLink(placement.ID, debridFile)
+	}
 	if err != nil {
 		return downloadLink, err
 	}

@@ -69,12 +69,15 @@ func NewTorrentRequest(debrid string, downloadFolder string, magnet *utils.Magne
 }
 
 func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr *arr.Arr, action config.DownloadAction, callBackUrl string, importType ImportType, skipMultiSeason bool) *ImportRequest {
+	// SelectedDebrid is left empty so AddNewNZB can pick the right backend at
+	// dispatch time — a Usenet-capable debrid (TorBox) when one is configured,
+	// or the direct-NNTP path as a fallback. Pinning to "usenet" here would
+	// force every NZB through NNTP and skip TorBox's /api/usenet/* endpoints.
 	return &ImportRequest{
 		Name:            name,
 		Id:              uuid.New().String(),
 		Status:          "started",
 		DownloadFolder:  downloadFolder,
-		SelectedDebrid:  "usenet", // NZB imports always use usenet
 		NZBContent:      nzbContent,
 		Arr:             arr,
 		Action:          action,
