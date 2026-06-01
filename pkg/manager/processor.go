@@ -544,7 +544,24 @@ func (m *Manager) processQueuedEntries() {
 				m.processingEntries.Delete(entry.InfoHash)
 			}
 		} else if entry.IsNZB() {
-			go m.processQueuedNZB(entry)
+			// Debrid-routed NZBs (TorBox /api/usenet/*) live on the
+			// debrid and surface through the same FUSE mount as
+			// torrents — process them via the torrent path. Only
+			// NZBs with ActiveProvider=="usenet" go through the
+			// NNTP fetcher, AND only when an NNTP client is
+			// actually configured. Without this guard a stale NZB
+			// queue entry against a nil m.usenet would deref the
+			// receiver in processQueuedNZB → SIGSEGV → container
+			// crash loop (observed 2026-06-01 with 11 restarts
+			// after the queue refactor introduced pendingSubmit
+			// state for NZB grabs that never reached a debrid).
+			if entry.ActiveProvider != "" && entry.ActiveProvider != "usenet" {
+				go m.processQueuedTorrent(entry)
+			} else if m.usenet != nil {
+				go m.processQueuedNZB(entry)
+			} else {
+				m.processingEntries.Delete(entry.InfoHash)
+			}
 		} else {
 			m.processingEntries.Delete(entry.InfoHash)
 		}
@@ -553,6 +570,14 @@ func (m *Manager) processQueuedEntries() {
 
 func (m *Manager) processQueuedNZB(entry *storage.Entry) {
 	defer m.processingEntries.Delete(entry.InfoHash)
+	// Belt-and-suspenders: the caller (processQueuedEntries) already
+	// short-circuits when m.usenet is nil, but a direct invocation
+	// without that guard would deref a nil receiver in
+	// m.usenet.GetNZB and crash the whole process. Don't trust callers.
+	if m.usenet == nil {
+		m.logger.Warn().Str("name", entry.Name).Msg("processQueuedNZB invoked but usenet client not configured — skipping")
+		return
+	}
 	// Check if the nzb is already processed
 	metadata, err := m.usenet.GetNZB(entry.InfoHash)
 	if err != nil {
