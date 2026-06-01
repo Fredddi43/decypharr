@@ -1,3 +1,23 @@
+// Package usenet implements the direct-NNTP code path. CAUTION:
+//
+//   - This package opens NNTP TCP sockets and resolves news-server
+//     hostnames in config.Usenet.Providers. If you don't want any NNTP
+//     traffic from decypharr, keep config.Usenet.Providers EMPTY and route
+//     NZBs through a Usenet-capable debrid (TorBox, via
+//     pkg/debrid/providers/torbox UsenetClient) instead. See
+//     internal/config/debrid.go SupportsUsenet.
+//
+//   - Four guards prevent accidental NNTP traffic when the user has not
+//     authorized it: (1) pkg/usenet.New() errors when Providers is empty,
+//     (2) pkg/manager init nil-checks m.usenet and AddNewNZB branches on
+//     the UsenetClient debrid first, (3) pkg/manager downloader's
+//     processUsenetDownload refuses to run for entries whose
+//     ActiveProvider != "usenet", and (4) internal/nntp.NewClient panics
+//     if instantiated with empty Providers.
+//
+//   - If you refactor any of those guards, also reconsider the panic in
+//     internal/nntp/client.go:NewClient — it exists specifically to crash
+//     loudly if a refactor accidentally bypasses the higher-level gates.
 package usenet
 
 import (

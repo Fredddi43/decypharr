@@ -102,6 +102,14 @@ func validateDebrids(debrids []Debrid) error {
 		if debrid.APIKey == "" {
 			return errors.New("debrid api key is required")
 		}
+		// SupportsUsenet currently only routes through TorBox's
+		// /api/usenet/* endpoints. RealDebrid/AllDebrid don't expose a
+		// Usenet API at all, so the flag would be silently ignored on
+		// those providers — fail closed instead so a misconfiguration is
+		// caught at startup, not at first NZB grab.
+		if debrid.SupportsUsenet && debrid.Provider != "torbox" {
+			return fmt.Errorf("%s: supports_usenet=true is only valid for provider=torbox (got %q)", debrid.Name, debrid.Provider)
+		}
 	}
 
 	return nil
@@ -158,6 +166,9 @@ func (c *Config) applyDebridEnvVars() {
 			}
 			if v := getEnv(prefix + "UNPACK_RAR"); v != "" {
 				c.Debrids[i].UnpackRar = parseBool(v)
+			}
+			if v := getEnv(prefix + "SUPPORTS_USENET"); v != "" {
+				c.Debrids[i].SupportsUsenet = parseBool(v)
 			}
 		}
 	}

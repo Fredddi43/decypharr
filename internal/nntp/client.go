@@ -146,11 +146,21 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 	return in
 }
 
-// NewClient creates a new connection manager
+// NewClient creates a new connection manager.
+//
+// PANICS if cfg.Usenet.Providers is empty. This is a deliberate tripwire,
+// not a misuse guard: when no NNTP providers are configured, the user has
+// opted out of direct-NNTP traffic and a separate guard in
+// pkg/usenet/usenet.go:New() must reject before we ever get here. If that
+// gate is refactored away (or any code path reaches this constructor with
+// an empty provider list), we want a loud crash — the alternative is
+// silently opening NNTP sockets the user explicitly declined to authorize.
+// See the package doc in pkg/usenet/usenet.go for the full privacy
+// invariant and the four-layer gate.
 func NewClient(cfg *config.Config) (*Client, error) {
 	providers := cfg.Usenet.Providers
 	if len(providers) == 0 {
-		return nil, errors.New("no NNTP providers configured")
+		panic("nntp.NewClient: instantiated with empty Usenet.Providers — privacy guarantee broken; the pkg/usenet gate must reject before reaching here")
 	}
 
 	// Sort providers by priority (lower number = higher priority)
