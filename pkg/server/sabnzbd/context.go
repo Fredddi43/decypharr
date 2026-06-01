@@ -122,14 +122,36 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 		}
 		if apikey != "" && cfg.UseAuth {
 			if authCfg := cfg.GetAuth(); authCfg != nil && authCfg.APIToken != "" && apikey == authCfg.APIToken {
+				// Token validated. Resolve the arr from the SAB
+				// `cat` param if present; allow nil otherwise.
+				//
+				// Sonarr/Radarr's "Test connection" button hits
+				// `mode=get_config` / `mode=version` WITHOUT a
+				// category — these are server-level introspection
+				// calls. Requiring an arr here breaks the test
+				// button before grabs ever happen. The
+				// NZB-submission handlers (addfile / addurl)
+				// resolve the arr themselves when actually
+				// processing a grab, and produce their own
+				// category-missing error there. Don't 400 here
+				// just because the test request is arr-less.
 				category := getCategory(r.Context())
-				a := s.resolveArrByCategory(category)
-				if a == nil {
+				if category != "" {
+					if a := s.resolveArrByCategory(category); a != nil {
+						ctx := context.WithValue(r.Context(), arrKey, a)
+						next.ServeHTTP(w, r.WithContext(ctx))
+						return
+					}
+					// Category specified but doesn't match a
+					// configured arr — flag clearly. Hits the
+					// addfile path where category IS required.
 					http.Error(w, fmt.Sprintf("unknown category %q — add this arr under Providers → Arrs in decypharr settings", category), http.StatusBadRequest)
 					return
 				}
-				ctx := context.WithValue(r.Context(), arrKey, a)
-				next.ServeHTTP(w, r.WithContext(ctx))
+				// Test / introspection call: no category, no arr.
+				// modeContext has already set a stub arr in the
+				// request context — leave it alone.
+				next.ServeHTTP(w, r)
 				return
 			}
 		}
