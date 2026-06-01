@@ -47,6 +47,15 @@ type Debrid struct {
 
 	// Directories
 	Directories map[string]WebdavDirectories `json:"directories,omitempty"` // Deprecated. Use global setting instead.
+
+	// SupportsUsenet routes NZBs submitted via SABnzbd-compat through this
+	// debrid's Usenet API endpoints (/api/usenet/* on TorBox) instead of
+	// decypharr's direct-NNTP path. Currently only valid on provider=torbox;
+	// validated at startup. When set on the user's only configured Usenet-
+	// capable debrid AND no config.Usenet.Providers are configured, the
+	// NNTP code path in pkg/usenet/* stays unreachable — the privacy
+	// guarantee for users who do not want NNTP traffic.
+	SupportsUsenet bool `json:"supports_usenet,omitempty"`
 }
 
 func (c *Config) updateDebrid(d Debrid) Debrid {

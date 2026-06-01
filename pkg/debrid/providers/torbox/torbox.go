@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"path"
@@ -958,4 +959,330 @@ func (tb *Torbox) SpeedTest(ctx context.Context) types.SpeedTestResult {
 
 func (tb *Torbox) SupportsCheck() bool {
 	return true
+}
+
+// --- TorBox Usenet integration ---------------------------------------
+//
+// These methods call TorBox's /api/usenet/* endpoints. They MUST NOT
+// be reachable when the user has no SupportsUsenet=true debrid
+// configured — dispatch in pkg/manager checks that flag before
+// type-asserting UsenetClient on this struct.
+
+// SupportsUsenet reports whether this TorBox instance is configured to
+// accept NZB submissions through /api/usenet/createusenetdownload.
+// Dispatched on by the manager to decide between this provider and the
+// (privacy-risky) direct-NNTP path in pkg/usenet/.
+func (tb *Torbox) SupportsUsenet() bool {
+	return tb.config.SupportsUsenet
+}
+
+// doSubmitPostMultipart performs a multipart/form-data POST via the
+// submit client. Used by SubmitNZB to upload the NZB file body alongside
+// the standard form fields (add_only_if_cached, etc.). Mirrors
+// doSubmitPostForm's fast-fail rate-limit semantics — the submit client
+// has its own non-blocking bucket, MaxRetries=1, and no retry on 429 so
+// callers can fall through to the next provider quickly.
+func (tb *Torbox) doSubmitPostMultipart(endpoint, fileFieldName, fileName string, fileBytes []byte, extraFields map[string]string, result interface{}) (*http.Response, error) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fileWriter, err := mw.CreateFormFile(fileFieldName, fileName)
+	if err != nil {
+		return nil, fmt.Errorf("multipart CreateFormFile: %w", err)
+	}
+	if _, err := fileWriter.Write(fileBytes); err != nil {
+		return nil, fmt.Errorf("multipart write file: %w", err)
+	}
+	for k, v := range extraFields {
+		if err := mw.WriteField(k, v); err != nil {
+			return nil, fmt.Errorf("multipart WriteField %s: %w", k, err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, fmt.Errorf("multipart close: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, tb.Host+endpoint, &body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := tb.submitClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if result != nil && resp.ContentLength != 0 {
+		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, err
+			}
+		}
+	}
+
+	return resp, nil
+}
+
+// SubmitNZB uploads an NZB to TorBox's /api/usenet/createusenetdownload
+// endpoint. Mirrors SubmitMagnet's error-classification block exactly so
+// the manager's retry chain treats transient capacity errors the same way
+// it treats torrent submission failures.
+//
+// Returns a *types.Torrent with Protocol="nzb" set, so downstream code
+// (linkService dispatch, downloader routing) can branch correctly to the
+// usenet endpoints without re-deriving protocol from the entry.
+func (tb *Torbox) SubmitNZB(nzbContent []byte, name string, downloadUncached bool) (*types.Torrent, error) {
+	var data CreateUsenetResponse
+
+	extraFields := map[string]string{}
+	if !downloadUncached {
+		extraFields["add_only_if_cached"] = "true"
+	}
+	if name != "" {
+		extraFields["name"] = name
+	}
+
+	// TorBox's createusenetdownload accepts the NZB content under the
+	// `file` form field per their API conventions. Field name is
+	// significant — if TorBox renames it in a future API revision, we'd
+	// need to update here.
+	resp, err := tb.doSubmitPostMultipart("/api/usenet/createusenetdownload", "file", name+".nzb", nzbContent, extraFields, &data)
+	if err != nil {
+		// Mirror SubmitMagnet's two-failure-mode handling:
+		//   1. Local non-blocking limiter rejected → ErrRateLimitExhausted
+		//   2. Server-side 429 chain exhausted in retryablehttp → "giving up after"
+		// Both map to RateLimitedError so the retry chain backs off.
+		if errors.Is(err, request.ErrRateLimitExhausted) {
+			return nil, customerror.RateLimitedError
+		}
+		if strings.Contains(err.Error(), "giving up after") {
+			return nil, fmt.Errorf("%w: %v", customerror.RateLimitedError, err)
+		}
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, customerror.RateLimitedError
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Same transient-vs-permanent classification as SubmitMagnet —
+		// HTTP 400 + "no servers available" / "try again later" body
+		// means retry, not permanent reject.
+		if isTransientTorboxRejection(data.Detail, data.Error) {
+			return nil, fmt.Errorf("%w: torbox usenet transient (HTTP %d): %s", customerror.RateLimitedError, resp.StatusCode, torboxDetailOrError(data.Detail, data.Error))
+		}
+		return nil, fmt.Errorf("torbox usenet API error: Status: %d: %s", resp.StatusCode, torboxDetailOrError(data.Detail, data.Error))
+	}
+	if data.Data == nil {
+		return nil, fmt.Errorf("torbox usenet: empty data on success response")
+	}
+
+	t := &types.Torrent{
+		Id:               strconv.Itoa(data.Data.Id),
+		InfoHash:         data.Data.Hash,
+		Name:             name,
+		Filename:         name,
+		OriginalFilename: name,
+		Debrid:           tb.config.Name,
+		Added:            time.Now(),
+		Protocol:         types.ProtocolNZB,
+	}
+	return t, nil
+}
+
+// GetUsenetDownload polls TorBox's /api/usenet/mylist/?id=X for a single
+// usenet entry. Mirrors GetTorrent for the torrent endpoint; the only
+// differences are the URL path, the response type, and the lack of
+// torrent-specific fields (seeds/peers/ratio) in the response.
+//
+// File.Link uses the same "torbox://{id}/{fileId}" scheme as torrents so
+// the link service / fetcher chain doesn't need protocol-aware
+// branching at the file level — the protocol decision happens upstream
+// when dispatching to GetUsenetDownloadLink vs GetDownloadLink.
+func (tb *Torbox) GetUsenetDownload(id string) (*types.Torrent, error) {
+	var res UsenetInfoResponse
+
+	resp, err := tb.doGet("/api/usenet/mylist/", map[string]string{"id": id}, &res)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("torbox usenet mylist: status %d", resp.StatusCode)
+	}
+	data := res.Data
+	if data == nil {
+		return nil, fmt.Errorf("torbox usenet mylist: empty data for id=%s", id)
+	}
+	t := &types.Torrent{
+		Id:               strconv.Itoa(data.Id),
+		InfoHash:         data.Hash,
+		Name:             data.Name,
+		Bytes:            data.Size,
+		Progress:         data.Progress * 100,
+		Status:           tb.getTorboxStatus(data.DownloadState, data.DownloadFinished),
+		Speed:            data.DownloadSpeed,
+		Filename:         data.Name,
+		OriginalFilename: data.Name,
+		Debrid:           tb.config.Name,
+		Files:            make(map[string]types.File),
+		Added:            data.CreatedAt,
+		Protocol:         types.ProtocolNZB,
+	}
+	cfg := config.Get()
+	for _, f := range data.Files {
+		fileName := filepath.Base(f.Name)
+		if err := cfg.IsFileAllowed(f.AbsolutePath, f.Size); err != nil {
+			continue
+		}
+		file := types.File{
+			TorrentId: t.Id,
+			Id:        strconv.Itoa(f.Id),
+			Name:      fileName,
+			Size:      f.Size,
+			Path:      f.Name,
+		}
+		if data.DownloadFinished {
+			file.Link = fmt.Sprintf("torbox://%s/%d", t.Id, f.Id)
+		}
+		t.Files[fileName] = file
+	}
+	var cleanPath string
+	if len(t.Files) > 0 {
+		cleanPath = path.Clean(data.Files[0].Name)
+	} else {
+		cleanPath = path.Clean(data.Name)
+	}
+	t.OriginalFilename = strings.Split(cleanPath, "/")[0]
+	return t, nil
+}
+
+// UpdateUsenetDownload refreshes an existing *types.Torrent from the
+// /api/usenet/mylist/?id=X endpoint. Same role as UpdateTorrent for
+// torrents — called from the sync/refresh loop and CheckStatus chain.
+func (tb *Torbox) UpdateUsenetDownload(t *types.Torrent) error {
+	var res UsenetInfoResponse
+
+	resp, err := tb.doGet("/api/usenet/mylist/", map[string]string{"id": t.Id}, &res)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("torbox usenet mylist: status %d", resp.StatusCode)
+	}
+	data := res.Data
+	if data == nil {
+		return fmt.Errorf("torbox usenet mylist: empty data for id=%s", t.Id)
+	}
+	t.Name = data.Name
+	t.Bytes = data.Size
+	t.Progress = data.Progress * 100
+	t.Status = tb.getTorboxStatus(data.DownloadState, data.DownloadFinished)
+	t.Speed = data.DownloadSpeed
+	t.Filename = data.Name
+	t.OriginalFilename = data.Name
+	if data.Hash != "" {
+		t.InfoHash = data.Hash
+	}
+	t.Debrid = tb.config.Name
+	t.Protocol = types.ProtocolNZB
+
+	t.Files = make(map[string]types.File)
+	cfg := config.Get()
+	for _, f := range data.Files {
+		fileName := filepath.Base(f.Name)
+		if err := cfg.IsFileAllowed(f.AbsolutePath, f.Size); err != nil {
+			continue
+		}
+		file := types.File{
+			TorrentId: t.Id,
+			Id:        strconv.Itoa(f.Id),
+			Name:      fileName,
+			Size:      f.Size,
+			Path:      fileName,
+		}
+		if data.DownloadFinished {
+			file.Link = fmt.Sprintf("torbox://%s/%s", t.Id, strconv.Itoa(f.Id))
+		}
+		t.Files[fileName] = file
+	}
+	var cleanPath string
+	if len(t.Files) > 0 {
+		cleanPath = path.Clean(data.Files[0].Name)
+	} else {
+		cleanPath = path.Clean(data.Name)
+	}
+	t.OriginalFilename = strings.Split(cleanPath, "/")[0]
+	return nil
+}
+
+// GetUsenetDownloadLink is the public entry point — same caching as
+// GetDownloadLink for torrents, just dispatched through the usenet
+// fetcher.
+func (tb *Torbox) GetUsenetDownloadLink(id string, file *types.File) (types.DownloadLink, error) {
+	return tb.accountsManager.GetDownloadLink(id, file, tb.fetchUsenetDownloadLink)
+}
+
+// fetchUsenetDownloadLink mirrors fetchDownloadLink (line 626) but hits
+// /api/usenet/requestdl with the usenet_id parameter. Same redirect=false
+// semantics — resolve the CDN URL ONCE per file, cache it, avoid
+// re-hitting /requestdl on every range read.
+func (tb *Torbox) fetchUsenetDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
+	var res DownloadLinksResponse
+	resp, err := tb.doGet("/api/usenet/requestdl", map[string]string{
+		"token":     account.Token,
+		"usenet_id": id,
+		"file_id":   file.Id,
+		"redirect":  "false",
+	}, &res)
+	if err != nil {
+		return types.DownloadLink{}, fmt.Errorf("torbox usenet requestdl: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return types.DownloadLink{}, fmt.Errorf("torbox usenet requestdl: %d", resp.StatusCode)
+	}
+	if !res.Success || res.Data == nil || *res.Data == "" {
+		return types.DownloadLink{}, fmt.Errorf("torbox usenet requestdl: empty data (success=%v, detail=%q)", res.Success, res.Detail)
+	}
+	cdnURL := *res.Data
+
+	now := time.Now()
+	dl := types.DownloadLink{
+		Filename:     file.Name,
+		Size:         file.Size,
+		Token:        tb.APIKey,
+		Link:         file.Link,
+		DownloadLink: cdnURL,
+		Debrid:       tb.config.Name,
+		Id:           file.Id,
+		Generated:    now,
+		ExpiresAt:    now.Add(tb.autoExpiresLinksAfter),
+	}
+	return dl, nil
+}
+
+// DeleteUsenetDownload removes a usenet entry from TorBox. Mirrors
+// DeleteTorrent (line 592) — POST to /api/usenet/controlusenetdownload
+// with operation=delete in the JSON body.
+func (tb *Torbox) DeleteUsenetDownload(id string) error {
+	payload := map[string]string{"usenet_id": id, "operation": "delete"}
+	data, err := json.ConfigDefault.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, tb.Host+"/api/usenet/controlusenetdownload", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tb.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("torbox usenet API error: Status: %d", resp.StatusCode)
+	}
+	tb.logger.Info().Msgf("Usenet download %s deleted from TorBox", id)
+	return nil
 }

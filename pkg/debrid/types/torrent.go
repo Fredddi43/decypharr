@@ -9,6 +9,14 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/arr"
 )
 
+// Protocol values for Torrent.Protocol. String-typed (not config.Protocol)
+// to avoid importing internal/config into the debrid types layer; the
+// storage layer casts between the two as needed.
+const (
+	ProtocolTorrent = "torrent"
+	ProtocolNZB     = "nzb"
+)
+
 type Torrent struct {
 	Id               string          `json:"id"`
 	InfoHash         string          `json:"info_hash"`
@@ -26,6 +34,11 @@ type Torrent struct {
 	Seeders          int             `json:"seeders"`
 	Links            []string        `json:"links"`
 	DeletedFiles     []string        `json:"deleted_files"`
+	// Protocol indicates how this Torrent was obtained — "torrent" (magnet
+	// submitted to a torrent debrid endpoint) or "nzb" (NZB submitted to a
+	// usenet endpoint). Empty string is treated as "torrent" for backward
+	// compatibility with existing code that doesn't set it.
+	Protocol string `json:"protocol,omitempty"`
 
 	Debrid string `json:"debrid"`
 
@@ -69,9 +82,18 @@ func (t *Torrent) Copy() *Torrent {
 		Speed:            t.Speed,
 		Seeders:          t.Seeders,
 		Links:            append([]string{}, t.Links...),
+		Protocol:         t.Protocol,
 		Debrid:           t.Debrid,
 		Arr:              t.Arr,
 	}
+}
+
+// IsNZB reports whether this Torrent represents a usenet (NZB) download
+// rather than a magnet/torrent. Used by dispatch logic in the manager
+// and downloader to route NZBs through usenet-specific API endpoints
+// instead of the torrent ones.
+func (t *Torrent) IsNZB() bool {
+	return t.Protocol == ProtocolNZB
 }
 
 func (t *Torrent) GetFile(filename string) (File, bool) {
