@@ -646,38 +646,52 @@ func (m *Manager) ResearchEntry(entry *storage.Entry) (bool, bool) {
 
 // SubmitQuotaInfo is the per-API snapshot served at
 // GET /api/debrids/{name}/quotas. The dashboard renders a radial-progress
-// per (debrid, api) using TokensAvailable / Capacity.
+// per (debrid, api) using TokensAvailable / Capacity. RefillPerSecond lets
+// the UI render a "next slot in Ns" countdown without polling the API
+// faster than necessary.
 type SubmitQuotaInfo struct {
-	API             string `json:"api"`              // "torrent" or "usenet"
-	Configured      string `json:"configured"`       // raw config string ("60/hour", etc.)
-	Capacity        int    `json:"capacity"`         // burst size of the bucket
-	TokensAvailable int    `json:"tokens_available"` // current refill state
+	API             string  `json:"api"`               // "torrent" or "usenet"
+	Configured      string  `json:"configured"`        // raw config string ("60/hour", etc.)
+	Capacity        int     `json:"capacity"`          // burst size (max tokens)
+	TokensAvailable float64 `json:"tokens_available"` // current refill state
+	RefillPerSecond float64 `json:"refill_per_second"` // tokens added per second
 }
 
-// SubmitQuotas returns the current submit-bucket state for both APIs on a
-// debrid. The Tokens reading is a snapshot from the limiter; it floats as
-// tokens refill at the configured rate. Returns ErrUnsupportedDebridProvider
-// when no client is configured under that name.
+// SubmitQuotas returns the current submit-bucket state for each API on a
+// debrid. Reads the live *rate.Limiter the provider exposes via the
+// SubmitLimiters interface — the same instance SubmitMagnet/SubmitNZB
+// consult, so the gauge readout matches what the next submit would
+// observe with no drift. Returns ErrUnsupportedDebridProvider when no
+// client is configured under that name.
 func (m *Manager) SubmitQuotas(name string) ([]SubmitQuotaInfo, error) {
 	client, ok := m.clients.Load(name)
 	if !ok {
 		return nil, ErrUnsupportedDebridProvider
 	}
-	out := []SubmitQuotaInfo{}
 	cfg := client.Config()
-	out = append(out, SubmitQuotaInfo{
-		API:        "torrent",
-		Configured: cfg.SubmitRateLimit,
-	})
+	limiters := client.SubmitLimiters()
+	apis := []string{"torrent"}
 	if cfg.SupportsUsenet {
-		usenetRaw := cfg.SubmitRateLimitUsenet
-		if usenetRaw == "" {
-			usenetRaw = cfg.SubmitRateLimit
+		apis = append(apis, "usenet")
+	}
+	out := make([]SubmitQuotaInfo, 0, len(apis))
+	for _, api := range apis {
+		info := SubmitQuotaInfo{API: api}
+		switch api {
+		case "torrent":
+			info.Configured = cfg.SubmitRateLimit
+		case "usenet":
+			info.Configured = cfg.SubmitRateLimitUsenet
+			if info.Configured == "" {
+				info.Configured = cfg.SubmitRateLimit
+			}
 		}
-		out = append(out, SubmitQuotaInfo{
-			API:        "usenet",
-			Configured: usenetRaw,
-		})
+		if lim := limiters[api]; lim != nil {
+			info.Capacity = lim.Burst()
+			info.TokensAvailable = lim.Tokens()
+			info.RefillPerSecond = float64(lim.Limit())
+		}
+		out = append(out, info)
 	}
 	return out, nil
 }

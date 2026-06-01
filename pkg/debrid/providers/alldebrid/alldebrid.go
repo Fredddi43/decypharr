@@ -32,6 +32,7 @@ type AllDebrid struct {
 	autoExpiresLinksAfter time.Duration
 	client                *request.Client
 	submitClient          *request.Client // /magnet/upload, /magnet/upload/file — fast-fail on 429
+	submitLimiter         *rate.Limiter   // exposed via SubmitLimiters() for dashboard gauges
 	Profile               *types.Profile `json:"profile"`
 	logger                zerolog.Logger
 	config                config.Debrid
@@ -81,6 +82,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
 		submitClient:          request.New(submitOpts...),
+		submitLimiter:         submitAllow,
 		logger:                _log,
 		config:                dc,
 	}
@@ -685,4 +687,8 @@ func (ad *AllDebrid) SpeedTest(ctx context.Context) types.SpeedTestResult {
 
 func (ad *AllDebrid) SupportsCheck() bool {
 	return false
+}
+
+func (ad *AllDebrid) SubmitLimiters() map[string]*rate.Limiter {
+	return map[string]*rate.Limiter{"torrent": ad.submitLimiter}
 }

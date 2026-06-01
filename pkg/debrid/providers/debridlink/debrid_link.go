@@ -30,6 +30,7 @@ type DebridLink struct {
 	DownloadUncached bool
 	client           *request.Client
 	submitClient     *request.Client // /seedbox/add — fast-fail on 429 for fallback
+	submitLimiter    *rate.Limiter   // exposed via SubmitLimiters() for dashboard gauges
 
 	autoExpiresLinksAfter time.Duration
 	logger                zerolog.Logger
@@ -84,6 +85,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		autoExpiresLinksAfter: autoExpiresLinksAfter,
 		client:                request.New(opts...),
 		submitClient:          request.New(submitOpts...),
+		submitLimiter:         submitAllow,
 		logger:                log,
 		config:                dc,
 	}
@@ -771,4 +773,8 @@ func (dl *DebridLink) SpeedTest(ctx context.Context) types.SpeedTestResult {
 
 func (dl *DebridLink) SupportsCheck() bool {
 	return false
+}
+
+func (dl *DebridLink) SubmitLimiters() map[string]*rate.Limiter {
+	return map[string]*rate.Limiter{"torrent": dl.submitLimiter}
 }

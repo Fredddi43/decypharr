@@ -47,6 +47,8 @@ type Torbox struct {
 	client                *request.Client
 	submitClient          *request.Client // for /api/torrents/createtorrent — separate rate-limit bucket; no 429 retry so fast-fail lets SendToDebrid fallback to the next provider
 	submitClientUsenet    *request.Client // for /api/usenet/createusenetdownload — independent bucket from submitClient since TorBox may or may not share the quota server-side
+	submitLimiter         *rate.Limiter   // kept alongside submitClient so SubmitLimiters() can expose live token state to the dashboard gauges
+	submitLimiterUsenet   *rate.Limiter   // ditto, for the usenet submit bucket
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -131,6 +133,8 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow,
 		client:                request.New(opts...),
 		submitClient:          request.New(submitOpts...),
 		submitClientUsenet:    request.New(submitUsenetOpts...),
+		submitLimiter:         submitAllow,
+		submitLimiterUsenet:   submitAllowUsenet,
 		logger:                _log,
 	}
 	return tb, nil
@@ -976,6 +980,21 @@ func (tb *Torbox) SpeedTest(ctx context.Context) types.SpeedTestResult {
 
 func (tb *Torbox) SupportsCheck() bool {
 	return true
+}
+
+// SubmitLimiters exposes the per-API submission rate-limiter handles so
+// the dashboard can render real-time quota gauges (tokens available, burst
+// capacity, refill rate). The "usenet" key is only present when
+// SupportsUsenet=true, since otherwise the bucket would never be drawn from.
+// nil values mean "no rate limit configured" and the UI should hide the gauge.
+func (tb *Torbox) SubmitLimiters() map[string]*rate.Limiter {
+	out := map[string]*rate.Limiter{
+		"torrent": tb.submitLimiter,
+	}
+	if tb.config.SupportsUsenet {
+		out["usenet"] = tb.submitLimiterUsenet
+	}
+	return out
 }
 
 // --- TorBox Usenet integration ---------------------------------------

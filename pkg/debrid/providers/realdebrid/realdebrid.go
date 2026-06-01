@@ -41,6 +41,7 @@ type RealDebrid struct {
 	client                *request.Client
 	repairClient          *request.Client
 	submitClient          *request.Client // /torrents/addMagnet, /torrents/addTorrent — fast-fail on 429 so SendToDebrid can fall over to another debrid
+	submitLimiter         *rate.Limiter   // kept for SubmitLimiters() gauge readout — same instance the submit client uses
 	autoExpiresLinksAfter time.Duration
 	logger                zerolog.Logger
 
@@ -105,6 +106,7 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter, submitAllow 
 		client:                request.New(opts...),
 		repairClient:          request.New(repairOpts...),
 		submitClient:          request.New(submitOpts...),
+		submitLimiter:         submitAllow,
 		logger:                logger.New(dc.Name),
 		rarSemaphore:          make(chan struct{}, 2),
 		config:                dc,
@@ -1205,4 +1207,11 @@ func (r *RealDebrid) SpeedTest(ctx context.Context) types.SpeedTestResult {
 
 func (r *RealDebrid) SupportsCheck() bool {
 	return true
+}
+
+// SubmitLimiters exposes the submit-bucket handle so the dashboard can
+// render a real-time quota gauge. RealDebrid has no Usenet API, so only
+// the torrent key is populated.
+func (r *RealDebrid) SubmitLimiters() map[string]*rate.Limiter {
+	return map[string]*rate.Limiter{"torrent": r.submitLimiter}
 }

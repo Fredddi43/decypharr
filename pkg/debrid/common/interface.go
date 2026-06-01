@@ -7,6 +7,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"golang.org/x/time/rate"
 )
 
 type Client interface {
@@ -29,6 +30,15 @@ type Client interface {
 	DeleteLink(dl types.DownloadLink) error
 	SpeedTest(ctx context.Context) types.SpeedTestResult
 	SupportsCheck() bool
+
+	// SubmitLimiters returns the per-API submission rate-limiter handles
+	// so the dashboard can render real-time quota gauges. Keys are
+	// "torrent" and (TorBox only) "usenet". A nil value or missing key
+	// means "no rate limit configured for this API on this provider".
+	// The returned *rate.Limiter is the same instance the SubmitMagnet /
+	// SubmitNZB code path consults — so the gauge readout matches what
+	// the next submit would observe, with no drift.
+	SubmitLimiters() map[string]*rate.Limiter
 }
 
 // UsenetClient is an optional capability interface implemented by debrid

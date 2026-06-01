@@ -665,13 +665,41 @@ class TorrentDashboard {
             for (const row of results) {
                 if (!row) continue;
                 for (const q of row.quotas) {
-                    if (!q.configured) continue;
+                    // Skip unconfigured buckets (no rate limit set → no
+                    // meaningful gauge). capacity=0 is the same signal.
+                    if (!q.configured || !q.capacity) continue;
+                    const tokens = Math.max(0, Math.floor(q.tokens_available || 0));
+                    const pct = Math.min(100, Math.round((tokens / q.capacity) * 100));
+                    // Pick a colour: green when plenty of headroom, amber
+                    // when burning through it, red when starved.
+                    const colour = pct >= 50 ? 'text-success' : pct >= 15 ? 'text-warning' : 'text-error';
+                    // "Next slot in Ns" — when tokens<1, how long until
+                    // the limiter would let through a single submit. Hidden
+                    // when refill_per_second is 0 (no rate limit) or when
+                    // tokens are healthy.
+                    let nextSlot = '';
+                    if (tokens < 1 && q.refill_per_second > 0) {
+                        const secs = Math.ceil(1 / q.refill_per_second);
+                        nextSlot = `<span class="text-xs opacity-70">next in ${secs}s</span>`;
+                    }
                     blocks.push(`
-                        <div class="quota-gauge badge badge-outline gap-2 px-3 py-3 h-auto">
-                            <i class="bi ${q.api === 'usenet' ? 'bi-newspaper' : 'bi-link-45deg'}"></i>
-                            <span class="font-medium">${this.escapeHtml(row.name)}</span>
-                            <span class="text-xs opacity-70">${this.escapeHtml(q.api)}</span>
-                            <span class="text-xs font-mono">${this.escapeHtml(q.configured)}</span>
+                        <div class="quota-gauge flex items-center gap-2 bg-base-200 rounded-lg px-3 py-2">
+                            <div class="radial-progress ${colour}" style="--value:${pct}; --size:2.5rem; --thickness:3px" role="progressbar">
+                                <span class="text-xs font-mono">${tokens}</span>
+                            </div>
+                            <div class="flex flex-col">
+                                <div class="flex items-center gap-1 text-sm">
+                                    <i class="bi ${q.api === 'usenet' ? 'bi-newspaper' : 'bi-link-45deg'}"></i>
+                                    <span class="font-medium">${this.escapeHtml(row.name)}</span>
+                                    <span class="text-xs opacity-70">${this.escapeHtml(q.api)}</span>
+                                </div>
+                                <div class="flex items-center gap-2 text-xs opacity-70">
+                                    <span class="font-mono">${tokens}/${q.capacity}</span>
+                                    <span>·</span>
+                                    <span>${this.escapeHtml(q.configured)}</span>
+                                    ${nextSlot}
+                                </div>
+                            </div>
                         </div>`);
                 }
             }

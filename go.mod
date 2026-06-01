@@ -28,7 +28,7 @@ require (
 	golang.org/x/net v0.43.0
 	golang.org/x/sync v0.18.0
 	golang.org/x/sys v0.38.0
-	golang.org/x/time v0.0.0-20220609170525-579cf78fd858
+	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.7
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
