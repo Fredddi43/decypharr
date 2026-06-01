@@ -682,9 +682,15 @@ class TorrentDashboard {
                         const secs = Math.ceil(1 / q.refill_per_second);
                         nextSlot = `<span class="text-xs opacity-70">next in ${secs}s</span>`;
                     }
+                    // Tooltip carries the ratio + refill detail for
+                    // anyone who wants the precise read. The at-a-glance
+                    // view stays minimal: number-in-ring tells you health.
+                    const refillSecs = q.refill_per_second > 0 ? Math.ceil(1 / q.refill_per_second) : 0;
+                    const health = pct >= 50 ? 'healthy' : pct >= 15 ? 'running low' : 'depleted';
+                    const tooltip = `${row.name} ${q.api} submit bucket ${health}: ${tokens} of ${q.capacity} tokens available${refillSecs ? `; refills 1 every ${refillSecs}s` : ''}`;
                     blocks.push(`
-                        <div class="quota-gauge flex items-center gap-2 bg-base-200 rounded-lg px-3 py-2">
-                            <div class="radial-progress ${colour}" style="--value:${pct}; --size:2.5rem; --thickness:3px" role="progressbar">
+                        <div class="quota-gauge flex items-center gap-2 bg-base-200 rounded-lg px-3 py-2" title="${this.escapeAttr(tooltip)}">
+                            <div class="radial-progress ${colour}" style="--value:${pct}; --size:2.5rem; --thickness:3px" role="progressbar" aria-label="${this.escapeAttr(tooltip)}">
                                 <span class="text-xs font-mono">${tokens}</span>
                             </div>
                             <div class="flex flex-col">
@@ -694,8 +700,6 @@ class TorrentDashboard {
                                     <span class="text-xs opacity-70">${this.escapeHtml(q.api)}</span>
                                 </div>
                                 <div class="flex items-center gap-2 text-xs opacity-70">
-                                    <span class="font-mono">${tokens}/${q.capacity}</span>
-                                    <span>·</span>
                                     <span>${this.escapeHtml(q.configured)}</span>
                                     ${nextSlot}
                                 </div>

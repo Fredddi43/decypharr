@@ -104,6 +104,116 @@ class ConfigManager {
 
         // Load queue janitor config (lives on the same Repair tab in the UI)
         this.populateQueueJanitorSettings(config.queue_janitor);
+
+        // Render the Debrid-routed Usenet panel under Providers → Usenet.
+        // Single source of truth for supports_usenet + submit_rate_limit_usenet
+        // on the TorBox debrid; the inputs on the TorBox debrid card itself
+        // are hidden mirrors. Re-rendered when debrids change.
+        this.renderUsenetDebridPanel();
+    }
+
+    // renderUsenetDebridPanel paints #torboxUsenetPanel based on the
+    // currently-rendered debrid form cards. If TorBox is in the list,
+    // show the configuration form (pre-populated from the hidden mirrors
+    // on the TorBox debrid card). Otherwise show a hint pointing the
+    // user at the Debrids sub-tab. Idempotent — safe to call after every
+    // debrid add/remove/provider-change.
+    renderUsenetDebridPanel() {
+        const panel = document.getElementById('torboxUsenetPanel');
+        if (!panel) return;
+
+        // Find the TorBox debrid card (if any). We rely on the rendered
+        // form, not the saved config object, because the user may have
+        // added/removed/edited TorBox without saving yet.
+        let torboxCard = null;
+        let torboxIndex = -1;
+        this.refs.debridConfigs.querySelectorAll('.debrid-config').forEach((card) => {
+            const idx = card.getAttribute('data-index');
+            const providerInput = card.querySelector(`[name="debrid[${idx}].provider"]`);
+            if (providerInput && providerInput.value === 'torbox') {
+                torboxCard = card;
+                torboxIndex = idx;
+            }
+        });
+
+        if (!torboxCard) {
+            panel.innerHTML = `
+                <div role="alert" class="alert alert-info">
+                    <i class="bi bi-info-circle"></i>
+                    <div>
+                        <h4 class="font-medium">No TorBox debrid configured yet</h4>
+                        <p class="text-sm opacity-80">Add TorBox under Providers → Debrids first, then come back here to enable Usenet routing.</p>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-primary"
+                            onclick="document.querySelector('.provider-subtab-button[data-provider-tab=&quot;debrid&quot;]').click()">
+                        Go to Debrids
+                    </button>
+                </div>`;
+            return;
+        }
+
+        // Mirror current values off the hidden inputs on the TorBox debrid card.
+        const enableMirror = torboxCard.querySelector(`[name="debrid[${torboxIndex}].supports_usenet"]`);
+        const rateMirror = torboxCard.querySelector(`[name="debrid[${torboxIndex}].submit_rate_limit_usenet"]`);
+        const enabled = enableMirror && (enableMirror.value === 'true' || enableMirror.checked === true);
+        const rate = rateMirror ? rateMirror.value : '';
+
+        // SAB-compat URL — respect URL base, computed at render time.
+        const base = (window.urlBase || '/').replace(/\/$/, '');
+        const sabUrl = `${window.location.origin}${base}/sabnzbd`;
+
+        panel.innerHTML = `
+            <div class="space-y-4">
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" class="checkbox checkbox-primary"
+                           id="usenetDebridEnabled" ${enabled ? 'checked' : ''}>
+                    <div>
+                        <span class="label-text font-medium">Enable NZB submissions through TorBox</span>
+                        <div class="label-text-alt opacity-70">Sonarr/Radarr NZB grabs are routed to TorBox's <code>/api/usenet/*</code> API. Direct-NNTP path is bypassed entirely.</div>
+                    </div>
+                </label>
+
+                <div id="usenetDebridDetails" class="${enabled ? '' : 'hidden'} space-y-4 pl-7">
+                    <div>
+                        <label class="label" for="usenetDebridSabUrl">
+                            <span class="font-medium">SABnzbd Download Client URL</span>
+                        </label>
+                        <div class="join w-full">
+                            <input type="text" class="input join-item flex-1 font-mono text-sm"
+                                   id="usenetDebridSabUrl" value="${window.decypharrUtils.escapeHtml(sabUrl)}" readonly>
+                            <button type="button" class="btn join-item"
+                                    onclick="window.decypharrUtils.copyToClipboard(document.getElementById('usenetDebridSabUrl').value)">
+                                <i class="bi bi-clipboard"></i> Copy
+                            </button>
+                        </div>
+                        <span class="text-sm opacity-70">
+                            Paste this as the SABnzbd URL in Sonarr / Radarr → Settings → Download Clients → Add → SABnzbd.
+                            Username: blank. API Key: the value shown under the
+                            <a href="#" class="link" onclick="event.preventDefault(); document.querySelector('.tab-button[data-tab=&quot;auth&quot;]').click()">Authentication</a>
+                            tab here. Category: <code>sonarr</code> or <code>radarr</code> (match the arr Name).
+                        </span>
+                    </div>
+                    <div>
+                        <label class="label" for="usenetDebridRate">
+                            <span class="font-medium">Submit Rate Limit (Usenet)</span>
+                        </label>
+                        <input type="text" class="input w-full" id="usenetDebridRate"
+                               value="${window.decypharrUtils.escapeHtml(rate)}"
+                               placeholder="60/hour (TorBox createusenetdownload quota)">
+                        <span class="text-sm opacity-70">Independent rate-limit bucket for the Usenet submit endpoint (<code>/api/usenet/createusenetdownload</code>). Empty falls back to the torrent Submit Rate Limit set on the TorBox debrid.</span>
+                    </div>
+                </div>
+            </div>`;
+
+        // Wire up checkbox toggle so the details panel hides when disabled.
+        // No save-on-change: values are written back at collectDebridConfigs() time.
+        const enableEl = document.getElementById('usenetDebridEnabled');
+        const detailsEl = document.getElementById('usenetDebridDetails');
+        if (enableEl && detailsEl) {
+            enableEl.addEventListener('change', () => {
+                detailsEl.classList.toggle('hidden', !enableEl.checked);
+            });
+        }
     }
 
     populateQueueJanitorSettings(qj) {
@@ -363,19 +473,14 @@ class ConfigManager {
             });
         }
 
-        // Toggle TorBox-only fields (submit_rate_limit_usenet,
-        // supports_usenet) based on the provider select. Initialise to
-        // the current value + re-evaluate on every change.
+        // Re-render the "Debrid-routed Usenet" panel under Providers
+        // → Usenet whenever this debrid card is (re)built or its
+        // provider changes — that panel is the single source of truth
+        // for supports_usenet + submit_rate_limit_usenet now, and it
+        // needs to know if a TorBox debrid exists.
         const providerSelect = newDebrid.querySelector(`[name="debrid[${this.debridCount}].provider"]`);
-        const toggleTorboxOnly = () => {
-            const isTorbox = providerSelect && providerSelect.value === 'torbox';
-            newDebrid.querySelectorAll('[data-torbox-only]').forEach(el => {
-                el.style.display = isTorbox ? '' : 'none';
-            });
-        };
         if (providerSelect) {
-            providerSelect.addEventListener('change', toggleTorboxOnly);
-            toggleTorboxOnly();
+            providerSelect.addEventListener('change', () => this.renderUsenetDebridPanel());
         }
 
         // Populate data if provided
@@ -436,7 +541,7 @@ class ConfigManager {
                         <i class="bi bi-cloud mr-2 text-secondary"></i>
                         Debrid #${index + 1}
                     </h3>
-                    <button type="button" class="btn btn-error btn-sm" onclick="this.closest('.debrid-config').remove();">
+                    <button type="button" class="btn btn-error btn-sm" onclick="this.closest('.debrid-config').remove(); window.configManager && window.configManager.renderUsenetDebridPanel();">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
@@ -534,23 +639,11 @@ class ConfigManager {
                                        placeholder="60/hour (TorBox createtorrent quota)">
                                 <span class="text-sm opacity-70">Per-bucket rate limit for the torrent submit endpoint (createtorrent / addMagnet). Set to <code>60/hour</code> for TorBox. Falls back to the general Rate Limit when empty.</span>
                             </div>
-                            <div data-torbox-only style="display:none">
-                                <label class="label" for="debrid[${index}].submit_rate_limit_usenet">
-                                    <span class=" font-medium">Submit Rate Limit (Usenet)</span>
-                                </label>
-                                <input type="text" class="input w-full"
-                                       name="debrid[${index}].submit_rate_limit_usenet" id="debrid[${index}].submit_rate_limit_usenet"
-                                       placeholder="60/hour (TorBox createusenetdownload quota)">
-                                <span class="text-sm opacity-70">Separate bucket for the Usenet submit endpoint (<code>/api/usenet/createusenetdownload</code>). Falls back to the torrent Submit Rate Limit when empty. TorBox may or may not share the quota with the torrent endpoint — split them so we don't waste quota if they're independent.</span>
-                            </div>
-                            <div data-torbox-only style="display:none">
-                                <label class="label cursor-pointer flex items-center gap-2" for="debrid[${index}].supports_usenet">
-                                    <input type="checkbox" class="checkbox"
-                                           name="debrid[${index}].supports_usenet" id="debrid[${index}].supports_usenet">
-                                    <span class="font-medium">Route NZBs through this provider (Usenet API)</span>
-                                </label>
-                                <span class="text-sm opacity-70">When enabled, NZBs grabbed by Sonarr/Radarr via decypharr's SABnzbd-compat endpoint are submitted to TorBox's <code>/api/usenet/*</code> API instead of decypharr's direct-NNTP path. TorBox-only — provides a complete NZB pipeline without needing a separate NNTP provider.</span>
-                            </div>
+<!-- Usenet routing settings for this debrid live under
+                                  Providers → Usenet → "Debrid-routed Usenet". Single
+                                  source of truth — see renderUsenetDebridPanel(). -->
+                            <input type="hidden" name="debrid[${index}].supports_usenet" id="debrid[${index}].supports_usenet">
+                            <input type="hidden" name="debrid[${index}].submit_rate_limit_usenet" id="debrid[${index}].submit_rate_limit_usenet">
                             <div>
                                 <label class="label" for="debrid[${index}].download_api_key_auto_heal" class="flex items-center gap-2 cursor-pointer">
                                     <input type="checkbox" class="checkbox"
@@ -1381,13 +1474,16 @@ class ConfigManager {
             if (submitRateLimitInput && submitRateLimitInput.value) {
                 debrid.submit_rate_limit = submitRateLimitInput.value;
             }
-            const submitRateLimitUsenetInput = getField('submit_rate_limit_usenet');
-            if (submitRateLimitUsenetInput && submitRateLimitUsenetInput.value) {
-                debrid.submit_rate_limit_usenet = submitRateLimitUsenetInput.value;
-            }
-            const supportsUsenetInput = getField('supports_usenet');
-            if (supportsUsenetInput) {
-                debrid.supports_usenet = supportsUsenetInput.checked;
+            // supports_usenet + submit_rate_limit_usenet are edited under
+            // Providers → Usenet → "Debrid-routed Usenet" (single source of
+            // truth). For the TorBox debrid we overlay those values; for
+            // every other provider, leave both unset (backend ignores them
+            // on non-torbox via validateDebrids).
+            if (debrid.provider === 'torbox') {
+                const enableEl = document.getElementById('usenetDebridEnabled');
+                const rateEl = document.getElementById('usenetDebridRate');
+                if (enableEl) debrid.supports_usenet = enableEl.checked;
+                if (rateEl && rateEl.value) debrid.submit_rate_limit_usenet = rateEl.value;
             }
             if (downloadKeyAutoHealInput) {
                 debrid.download_api_key_auto_heal = downloadKeyAutoHealInput.checked;

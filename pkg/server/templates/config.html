@@ -394,6 +394,26 @@
                         <!-- Usenet Sub-tab Content -->
                         <div class="provider-subtab-content hidden" data-provider-tab-content="usenet">
                             <div class="space-y-6">
+                                <!-- Debrid-routed Usenet — NZBs through a debrid's own
+                                     /api/usenet/* endpoint instead of decypharr's direct
+                                     NNTP path. Rendered first because it's the recommended
+                                     setup for users who don't already have an NNTP provider. -->
+                                <div class="card bg-base-200">
+                                    <div class="card-body">
+                                        <h4 class="text-lg font-semibold mb-4 flex items-center">
+                                            <i class="bi bi-cloud-download mr-2 text-primary"></i>Debrid-routed Usenet (no NNTP needed)
+                                        </h4>
+                                        <p class="text-sm opacity-70 mb-4">
+                                            Route NZB grabs through a debrid's own Usenet API instead of decypharr's direct-NNTP path.
+                                            No NNTP provider needed. Currently supported: <strong>TorBox</strong>.
+                                        </p>
+                                        <div id="torboxUsenetPanel">
+                                            <!-- Rendered by config.js renderUsenetDebridPanel() — either an
+                                                 "Add TorBox first" hint or the live configuration form. -->
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <!-- Streaming Settings -->
                                 <div class="card bg-base-200">
                                     <div class="card-body">
