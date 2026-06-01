@@ -124,6 +124,94 @@ type DownloadLinksResponse APIResponse[string]
 
 type TorrentsListResponse APIResponse[[]torboxInfo]
 
+// --- Usenet types ------------------------------------------------------
+//
+// TorBox's /api/usenet/* endpoints mirror /api/torrents/* shape: same
+// wrapper, same Files array semantics, same dual-format quirk on the
+// singular `?id=X` lookup. The fields below are torrent-shaped minus
+// the torrent-specific bits (seeds/peers/ratio/tracker) — those don't
+// exist for NZB downloads.
+
+type usenetInfo struct {
+	Id              int         `json:"id"`
+	AuthId          string      `json:"auth_id"`
+	Server          int         `json:"server"`
+	Hash            string      `json:"hash"`
+	Name            string      `json:"name"`
+	Size            int64       `json:"size"`
+	Active          bool        `json:"active"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+	DownloadState   string      `json:"download_state"`
+	Progress        float64     `json:"progress"`
+	DownloadSpeed   int64       `json:"download_speed"`
+	Eta             int         `json:"eta"`
+	ExpiresAt       interface{} `json:"expires_at"`
+	DownloadPresent bool        `json:"download_present"`
+	Files           []struct {
+		Id           int    `json:"id"`
+		Name         string `json:"name"`
+		Size         int64  `json:"size"`
+		Hash         string `json:"hash"`
+		Mimetype     string `json:"mimetype"`
+		ShortName    string `json:"short_name"`
+		S3Path       string `json:"s3_path"`
+		AbsolutePath string `json:"absolute_path"`
+	} `json:"files"`
+	DownloadPath     string      `json:"download_path"`
+	Availability     float64     `json:"availability"`
+	DownloadFinished bool        `json:"download_finished"`
+	Cached           bool        `json:"cached"`
+	Owner            string      `json:"owner"`
+}
+
+type UsenetInfoResponse APIResponse[usenetInfo]
+
+// UnmarshalJSON accepts both response shapes for /api/usenet/mylist?id=X
+// — singular object and one-element array. Same defensive pattern as
+// InfoResponse above; TorBox's usenet endpoints inherit the same
+// dual-format quirk that bit us on /api/torrents/mylist 2026-05-30.
+func (r *UsenetInfoResponse) UnmarshalJSON(data []byte) error {
+	type shadow APIResponse[usenetInfo]
+
+	var singular shadow
+	if err := json.Unmarshal(data, &singular); err == nil {
+		*r = UsenetInfoResponse(singular)
+		return nil
+	}
+
+	type arrayShape struct {
+		Success bool         `json:"success"`
+		Error   any          `json:"error"`
+		Detail  string       `json:"detail"`
+		Data    []usenetInfo `json:"data"`
+	}
+	var arr arrayShape
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return fmt.Errorf("torbox UsenetInfoResponse: data is neither object nor array: %w", err)
+	}
+	r.Success = arr.Success
+	r.Error = arr.Error
+	r.Detail = arr.Detail
+	if len(arr.Data) == 0 {
+		r.Data = nil
+		return nil
+	}
+	first := arr.Data[0]
+	r.Data = &first
+	return nil
+}
+
+type UsenetListResponse APIResponse[[]usenetInfo]
+
+// CreateUsenetResponse is the response wrapper for
+// /api/usenet/createusenetdownload. Mirrors AddMagnetResponse for
+// torrents but with the usenet-specific `usenetdownload_id` field name.
+type CreateUsenetResponse APIResponse[struct {
+	Id   int    `json:"usenetdownload_id"`
+	Hash string `json:"hash,omitempty"`
+}]
+
 type profileResponse struct {
 	Id                        int64  `json:"id"`
 	AuthId                    string `json:"auth_id"`

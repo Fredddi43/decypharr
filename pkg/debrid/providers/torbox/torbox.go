@@ -291,15 +291,17 @@ var transientTorboxRejectionPatterns = []string{
 	"temporarily unavailable",
 }
 
-func isTransientTorboxRejection(data *AddMagnetResponse) bool {
-	if data == nil {
-		return false
-	}
-	text := strings.ToLower(data.Detail)
-	if errStr, ok := data.Error.(string); ok {
+// isTransientTorboxRejection takes the wrapper-level Detail + Error fields
+// from any TorBox response (AddMagnetResponse, CreateUsenetResponse, etc.)
+// and reports whether the message body matches a known transient pattern.
+// Generic over response shape — the wrapper fields are identical across
+// /api/torrents/createtorrent and /api/usenet/createusenetdownload.
+func isTransientTorboxRejection(detail string, errAny any) bool {
+	text := strings.ToLower(detail)
+	if errStr, ok := errAny.(string); ok {
 		text += " " + strings.ToLower(errStr)
 	}
-	if text == " " || text == "" {
+	if strings.TrimSpace(text) == "" {
 		return false
 	}
 	for _, p := range transientTorboxRejectionPatterns {
@@ -310,14 +312,14 @@ func isTransientTorboxRejection(data *AddMagnetResponse) bool {
 	return false
 }
 
-func torboxDetailOrError(data *AddMagnetResponse) string {
-	if data == nil {
-		return ""
+// torboxDetailOrError returns the most-informative human-readable error
+// string from a TorBox response wrapper. Detail takes precedence over the
+// Error field (which is sometimes string, sometimes null/object).
+func torboxDetailOrError(detail string, errAny any) string {
+	if detail != "" {
+		return detail
 	}
-	if data.Detail != "" {
-		return data.Detail
-	}
-	if errStr, ok := data.Error.(string); ok && errStr != "" {
+	if errStr, ok := errAny.(string); ok && errStr != "" {
 		return errStr
 	}
 	return "(no detail)"
@@ -368,8 +370,8 @@ func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 		// release for the episode" (observed 2026-05-31). Match the
 		// transient strings and surface RateLimitedError so the existing
 		// retry chain handles them like a 429.
-		if isTransientTorboxRejection(&data) {
-			return nil, fmt.Errorf("%w: torbox transient (HTTP %d): %s", customerror.RateLimitedError, resp.StatusCode, torboxDetailOrError(&data))
+		if isTransientTorboxRejection(data.Detail, data.Error) {
+			return nil, fmt.Errorf("%w: torbox transient (HTTP %d): %s", customerror.RateLimitedError, resp.StatusCode, torboxDetailOrError(data.Detail, data.Error))
 		}
 		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
 	}

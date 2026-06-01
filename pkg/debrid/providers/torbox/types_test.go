@@ -200,10 +200,119 @@ func TestIsTransientTorboxRejection(t *testing.T) {
 			if err := json.Unmarshal([]byte(tc.body), &r); err != nil {
 				t.Fatalf("unmarshal failed: %v", err)
 			}
-			got := isTransientTorboxRejection(&r)
+			got := isTransientTorboxRejection(r.Detail, r.Error)
 			if got != tc.want {
 				t.Fatalf("isTransientTorboxRejection: want %v got %v for body %q", tc.want, got, tc.body)
 			}
 		})
+	}
+}
+
+// TestUsenetInfoResponseUnmarshalDualShape verifies the same dual-format
+// handling for /api/usenet/mylist?id=X as InfoResponse has for the torrent
+// equivalent. TorBox's usenet endpoints inherit the same shape quirks.
+func TestUsenetInfoResponseUnmarshalDualShape(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantNilData bool
+		wantErr     bool
+		wantId      int
+	}{
+		{
+			name:   "singular_object_data",
+			body:   `{"success":true,"error":null,"detail":"ok","data":{"id":42,"hash":"abc","name":"X.nzb"}}`,
+			wantId: 42,
+		},
+		{
+			name:   "array_data_single_element",
+			body:   `{"success":true,"error":null,"detail":"ok","data":[{"id":42,"hash":"abc","name":"X.nzb"}]}`,
+			wantId: 42,
+		},
+		{
+			name:   "array_data_multi_element_lifts_first",
+			body:   `{"success":true,"error":null,"detail":"ok","data":[{"id":111,"hash":"a"},{"id":222,"hash":"b"}]}`,
+			wantId: 111,
+		},
+		{
+			name:        "empty_array_data_yields_nil",
+			body:        `{"success":true,"error":null,"detail":"none","data":[]}`,
+			wantNilData: true,
+		},
+		{
+			name:        "null_data_yields_nil",
+			body:        `{"success":true,"error":null,"detail":"none","data":null}`,
+			wantNilData: true,
+		},
+		{
+			name:    "garbage_data_returns_error",
+			body:    `{"success":true,"data":"not an object or array"}`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var r UsenetInfoResponse
+			err := json.Unmarshal([]byte(tc.body), &r)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil; data=%+v", r.Data)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.wantNilData {
+				if r.Data != nil {
+					t.Fatalf("expected Data=nil, got %+v", *r.Data)
+				}
+				return
+			}
+			if r.Data == nil {
+				t.Fatalf("expected Data set, got nil")
+			}
+			if r.Data.Id != tc.wantId {
+				t.Fatalf("Id: want %d got %d", tc.wantId, r.Data.Id)
+			}
+		})
+	}
+}
+
+// TestCreateUsenetResponseUnmarshal verifies the response shape for
+// /api/usenet/createusenetdownload (success path returns usenetdownload_id).
+func TestCreateUsenetResponseUnmarshal(t *testing.T) {
+	body := `{"success":true,"error":null,"detail":"Usenet download added.","data":{"usenetdownload_id":12345,"hash":"deadbeef"}}`
+	var r CreateUsenetResponse
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if !r.Success {
+		t.Fatalf("expected success=true")
+	}
+	if r.Data == nil {
+		t.Fatalf("expected Data set")
+	}
+	if r.Data.Id != 12345 {
+		t.Fatalf("Id: want 12345 got %d", r.Data.Id)
+	}
+	if r.Data.Hash != "deadbeef" {
+		t.Fatalf("Hash: want deadbeef got %q", r.Data.Hash)
+	}
+}
+
+// TestIsTransientTorboxRejection_OnCreateUsenetResponse verifies the
+// refactored signature works equivalently for the usenet response wrapper.
+// This is the parity test that locks in cross-wrapper compatibility — if
+// TorBox sends the SAME "No servers available" HTTP 400 on the usenet
+// endpoint, our retry chain must classify it identically.
+func TestIsTransientTorboxRejection_OnCreateUsenetResponse(t *testing.T) {
+	body := `{"success":false,"error":null,"detail":"No servers available for download this torrent. Please try again later.","data":null}`
+	var r CreateUsenetResponse
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if !isTransientTorboxRejection(r.Detail, r.Error) {
+		t.Fatalf("expected transient=true for 'no servers available' on CreateUsenetResponse")
 	}
 }
