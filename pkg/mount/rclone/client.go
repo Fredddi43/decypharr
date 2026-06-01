@@ -1,11 +1,13 @@
 package rclone
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -47,10 +49,18 @@ func (m *Manager) performMount(ctx context.Context) error {
 		return nil
 	}
 
-	// Clean up any stale mount first
-	if mountInfo != nil && !mountInfo.Mounted {
-		err := m.forceUnmount(ctx)
-		if err != nil {
+	// Clean up any stale mount first. mountInfo is nil on a fresh process (e.g. the
+	// container restarted after an unclean death), so we cannot rely on in-memory
+	// state alone — probe the filesystem directly. A stale FUSE mount (stat returns
+	// ENOTCONN) MUST be force-unmounted before rclone can mount over the path,
+	// otherwise the mount hangs. We also keep the original behaviour of clearing a
+	// mount we know we lost (mountInfo present but not Mounted).
+	if isStaleMount(cfg.MountPath) || (mountInfo != nil && !mountInfo.Mounted) {
+		if isStaleMount(cfg.MountPath) {
+			m.logger.Warn().Str("path", cfg.MountPath).
+				Msg("Detected stale FUSE mount (ENOTCONN), force-unmounting before remount")
+		}
+		if err := m.forceUnmount(ctx); err != nil {
 			return err
 		}
 	}
@@ -273,4 +283,18 @@ func (m *Manager) tryUnmountCommand(ctx context.Context, args ...string) error {
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	return cmd.Run()
+}
+
+// isStaleMount reports whether path is a broken FUSE mount — i.e. stat returns
+// ENOTCONN ("transport endpoint is not connected", errno 107). This happens when
+// a prior rclone process died without unmounting; the dead mount must be
+// force-unmounted before a new mount can succeed. A non-existent path (ENOENT,
+// e.g. before the first mount) is not stale, so this returns false there.
+func isStaleMount(path string) bool {
+	if path == "" {
+		return false
+	}
+	var st syscall.Stat_t
+	err := syscall.Stat(path, &st)
+	return errors.Is(err, syscall.ENOTCONN)
 }

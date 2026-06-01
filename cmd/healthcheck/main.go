@@ -3,12 +3,14 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	json "github.com/bytedance/sonic"
@@ -21,6 +23,7 @@ type HealthStatus struct {
 	QbitAPI       bool `json:"qbit_api"`
 	WebUI         bool `json:"web_ui"`
 	WebDAVService bool `json:"webdav_service"`
+	Mount         bool `json:"mount"`
 	OverallStatus bool `json:"overall_status"`
 }
 
@@ -42,6 +45,7 @@ func main() {
 		QbitAPI:       false,
 		WebUI:         false,
 		WebDAVService: false,
+		Mount:         false,
 		OverallStatus: false,
 	}
 
@@ -60,9 +64,11 @@ func main() {
 	status.QbitAPI = checkQbitAPI(ctx, client, baseUrl, port, auth, cfg.UseAuth)
 	status.WebUI = checkWebUI(ctx, client, baseUrl, port, auth, cfg.UseAuth)
 	status.WebDAVService = checkBaseWebdav(ctx, client, baseUrl, port, cfg)
+	status.Mount = checkMount(cfg.Mount.MountPath)
 	// Determine overall status
-	// Consider the application healthy if core services are running
-	status.OverallStatus = status.QbitAPI && status.WebUI && status.WebDAVService
+	// Consider the application healthy if core services are running AND the FUSE
+	// mount is not stale (a stale mount answers HTTP fine but the filesystem is dead).
+	status.OverallStatus = status.QbitAPI && status.WebUI && status.WebDAVService && status.Mount
 
 	// Optional: output health status as JSON for logging
 	if debug {
@@ -126,6 +132,20 @@ func checkBaseWebdav(ctx context.Context, client *http.Client, baseUrl, port str
 
 	authMayBeRequired := cfg.UseAuth && cfg.EnableWebdavAuth
 	return isHealthyStatus(resp.StatusCode, authMayBeRequired, http.StatusOK, http.StatusCreated, http.StatusMultiStatus)
+}
+
+// checkMount returns false only when the FUSE mountpoint is stale — i.e. stat
+// returns ENOTCONN ("transport endpoint is not connected", errno 107), which means
+// rclone died without unmounting and the filesystem is unusable even though the
+// HTTP services still answer. An empty mount path (no mount configured) or a
+// not-yet-created path (ENOENT, during startup) is treated as healthy.
+func checkMount(mountPath string) bool {
+	if mountPath == "" {
+		return true
+	}
+	var st syscall.Stat_t
+	err := syscall.Stat(mountPath, &st)
+	return !errors.Is(err, syscall.ENOTCONN)
 }
 
 func localURL(port, baseUrl, endpoint string) string {

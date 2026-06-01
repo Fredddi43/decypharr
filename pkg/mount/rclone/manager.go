@@ -35,6 +35,7 @@ type Manager struct {
 	cancel        context.CancelFunc
 	serverReady   chan struct{}
 	serverStarted atomic.Bool
+	recovering    atomic.Bool
 	info          atomic.Pointer[MountInfo]
 	manager       *manager.Manager
 	webdavURL     string
@@ -272,11 +273,15 @@ func (m *Manager) startMount(ctx context.Context) error {
 		return fmt.Errorf("rclone RC server is not reachable: %w", err)
 	}
 
+	// Start the health monitor unconditionally, before attempting the mount, so a
+	// boot whose first mount fails (e.g. it lost a race against a stale OS mount)
+	// is still retried on the next tick instead of being stranded.
+	go m.MonitorMounts(ctx)
+
 	if err := m.mountWithRetry(ctx, 3); err != nil {
-		m.logger.Error().Err(err).Msg("Mount operation failed")
+		m.logger.Error().Err(err).Msg("Mount operation failed; health monitor will keep retrying")
 		return err
 	}
-	go m.MonitorMounts(ctx)
 	return nil
 }
 
