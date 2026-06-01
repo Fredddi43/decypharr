@@ -16,7 +16,16 @@ import (
 )
 
 func (m *Manager) syncTorrents(ctx context.Context) {
-	// First time syncTorrents debrid -> storage
+	// First time syncTorrents debrid -> storage.
+	//
+	// Each per-debrid refresh runs under a bounded 30s context so a
+	// bad API key (or a stalled provider) can't hold the initial-sync
+	// goroutine for minutes. The default request timeout is 60s × up
+	// to 5 retries with 30s backoff, which adds up to ~150s of
+	// network IO per call before bailing — long enough that
+	// operators perceive it as "decypharr is blocked at startup". The
+	// periodic 10m refresh job (added by addQueueProcessorJob) will
+	// retry from a clean state once the operator fixes the key.
 	m.logger.Info().
 		Int("debrids", m.clients.Size()).
 		Msg("Performing initial sync of torrents from debrid clients...")
@@ -25,8 +34,10 @@ func (m *Manager) syncTorrents(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := m.refreshTorrents(ctx, name, client); err != nil {
-				m.logger.Error().Err(err).Str("debrid", name).Msg("Initial torrent sync failed")
+			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := m.refreshTorrents(syncCtx, name, client); err != nil {
+				m.logger.Error().Err(err).Str("debrid", name).Msg("Initial torrent sync failed (will retry on next periodic refresh)")
 			}
 			m.RefreshEntries(false)
 		}()
