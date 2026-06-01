@@ -687,7 +687,15 @@ class TorrentDashboard {
                     // view stays minimal: number-in-ring tells you health.
                     const refillSecs = q.refill_per_second > 0 ? Math.ceil(1 / q.refill_per_second) : 0;
                     const health = pct >= 50 ? 'healthy' : pct >= 15 ? 'running low' : 'depleted';
-                    const tooltip = `${row.name} ${q.api} submit bucket ${health}: ${tokens} of ${q.capacity} tokens available${refillSecs ? `; refills 1 every ${refillSecs}s` : ''}`;
+                    // Mark the readout's provenance — "observed" =
+                    // server-issued X-RateLimit headers (authoritative);
+                    // "local" = our client-side rate.Limiter (estimate
+                    // that drifts from reality after restart or when
+                    // other clients drain the account). Default backend
+                    // is "local"; "observed" appears once TorBox sends
+                    // its first header.
+                    const sourceLabel = q.source === 'observed' ? 'TorBox-reported' : 'estimated';
+                    const tooltip = `${row.name} ${q.api} submit bucket ${health} (${sourceLabel}): ${tokens} of ${q.capacity} tokens available${refillSecs ? `; refills 1 every ${refillSecs}s` : ''}`;
                     blocks.push(`
                         <div class="quota-gauge flex items-center gap-2 bg-base-200 rounded-lg px-3 py-2" title="${this.escapeAttr(tooltip)}">
                             <div class="radial-progress ${colour}" style="--value:${pct}; --size:2.5rem; --thickness:3px" role="progressbar" aria-label="${this.escapeAttr(tooltip)}">
@@ -698,6 +706,9 @@ class TorrentDashboard {
                                     <i class="bi ${q.api === 'usenet' ? 'bi-newspaper' : 'bi-link-45deg'}"></i>
                                     <span class="font-medium">${this.escapeHtml(row.name)}</span>
                                     <span class="text-xs opacity-70">${this.escapeHtml(q.api)}</span>
+                                    ${q.source === 'observed'
+                                        ? '<span class="badge badge-xs badge-success" title="Value comes from TorBox X-RateLimit headers — authoritative">live</span>'
+                                        : '<span class="badge badge-xs badge-ghost" title="Local estimate from the client-side rate limiter — may drift from TorBox until next submit response">est</span>'}
                                 </div>
                                 <div class="flex items-center gap-2 text-xs opacity-70">
                                     <span>${this.escapeHtml(q.configured)}</span>

@@ -158,9 +158,41 @@ class ConfigManager {
         const enabled = enableMirror && (enableMirror.value === 'true' || enableMirror.checked === true);
         const rate = rateMirror ? rateMirror.value : '';
 
-        // SAB-compat URL — respect URL base, computed at render time.
+        // Sonarr/Radarr's SABnzbd Download Client form has discrete fields
+        // (Host, Port, URL Base, API Key, SSL). Showing each separately +
+        // copyable lets the user paste one-to-one with zero room for typos —
+        // a previous user pasted `/sabnzb` (missing the trailing 'd') into
+        // URL Base because they copied a partial slug from a single combined
+        // URL field. One copy button per arr field eliminates that class
+        // of error.
+        const useSSL = window.location.protocol === 'https:';
+        const hostname = window.location.hostname;
+        const port = window.location.port || (useSSL ? '443' : '80');
         const base = (window.urlBase || '/').replace(/\/$/, '');
-        const sabUrl = `${window.location.origin}${base}/sabnzbd`;
+        const urlBasePath = `${base}/sabnzbd`;
+        // The decypharr Bearer token (issued under Authentication tab) IS
+        // the SABnzbd API Key from the arr's perspective. Pull live from
+        // the populated Auth tab field so reveals + refreshes show up here
+        // without a page reload.
+        const tokenEl = document.getElementById('api-token-display');
+        const apiKey = (tokenEl && tokenEl.value && tokenEl.value !== '****') ? tokenEl.value : '';
+
+        const copyField = (id, label, value, hint = '') => `
+            <div>
+                <label class="label" for="${id}">
+                    <span class="font-medium">${label}</span>
+                </label>
+                <div class="join w-full">
+                    <input type="text" class="input join-item flex-1 font-mono text-sm"
+                           id="${id}" value="${window.decypharrUtils.escapeHtml(value)}" readonly
+                           onclick="this.select()">
+                    <button type="button" class="btn join-item" title="Copy"
+                            onclick="window.decypharrUtils.copyToClipboard(document.getElementById('${id}').value)">
+                        <i class="bi bi-clipboard"></i>
+                    </button>
+                </div>
+                ${hint ? `<span class="text-xs opacity-70">${hint}</span>` : ''}
+            </div>`;
 
         panel.innerHTML = `
             <div class="space-y-4">
@@ -174,25 +206,23 @@ class ConfigManager {
                 </label>
 
                 <div id="usenetDebridDetails" class="${enabled ? '' : 'hidden'} space-y-4 pl-7">
-                    <div>
-                        <label class="label" for="usenetDebridSabUrl">
-                            <span class="font-medium">SABnzbd Download Client URL</span>
-                        </label>
-                        <div class="join w-full">
-                            <input type="text" class="input join-item flex-1 font-mono text-sm"
-                                   id="usenetDebridSabUrl" value="${window.decypharrUtils.escapeHtml(sabUrl)}" readonly>
-                            <button type="button" class="btn join-item"
-                                    onclick="window.decypharrUtils.copyToClipboard(document.getElementById('usenetDebridSabUrl').value)">
-                                <i class="bi bi-clipboard"></i> Copy
-                            </button>
+                    <div role="alert" class="alert alert-info">
+                        <i class="bi bi-info-circle"></i>
+                        <div>
+                            <div class="font-medium">Set up the SABnzbd Download Client in Sonarr/Radarr</div>
+                            <div class="text-sm opacity-90">Settings → Download Clients → Add → SABnzbd. Paste each field below into the matching arr field. Category: use <code>sonarr</code> or <code>radarr</code> to match the arr Name configured here.</div>
                         </div>
-                        <span class="text-sm opacity-70">
-                            Paste this as the SABnzbd URL in Sonarr / Radarr → Settings → Download Clients → Add → SABnzbd.
-                            Username: blank. API Key: the value shown under the
-                            <a href="#" class="link" onclick="event.preventDefault(); document.querySelector('.tab-button[data-tab=&quot;auth&quot;]').click()">Authentication</a>
-                            tab here. Category: <code>sonarr</code> or <code>radarr</code> (match the arr Name).
-                        </span>
                     </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        ${copyField('usenetSabHost',    'Host',     hostname,    'Arr field: <em>Host</em>')}
+                        ${copyField('usenetSabPort',    'Port',     port,        'Arr field: <em>Port</em>')}
+                        ${copyField('usenetSabUrlBase', 'URL Base', urlBasePath, 'Arr field: <em>URL Base</em> (mandatory — without this the test 404s)')}
+                        ${copyField('usenetSabApiKey',  'API Key',  apiKey || '(see Authentication tab)', apiKey ? 'Arr field: <em>API Key</em>. Same as the Bearer token on the Authentication tab.' : 'Reveal the token under <a href="#" class="link" onclick="event.preventDefault(); document.querySelector(\'.tab-button[data-tab=&quot;auth&quot;]\').click()">Authentication</a>, then come back here.')}
+                    </div>
+
+                    <div class="text-xs opacity-70"><strong>Use SSL</strong>: ${useSSL ? 'tick the arr <em>Use SSL</em> checkbox (decypharr is served over HTTPS).' : 'leave the arr <em>Use SSL</em> checkbox unchecked (decypharr is served over HTTP on the LAN).'}</div>
+
                     <div>
                         <label class="label" for="usenetDebridRate">
                             <span class="font-medium">Submit Rate Limit (Usenet)</span>

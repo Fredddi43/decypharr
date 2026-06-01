@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -39,6 +40,28 @@ type Client interface {
 	// SubmitNZB code path consults — so the gauge readout matches what
 	// the next submit would observe, with no drift.
 	SubmitLimiters() map[string]*rate.Limiter
+}
+
+// ObservedQuota is a server-authoritative rate-limit snapshot — the
+// actual state TorBox (or any future provider) reported via X-RateLimit-*
+// headers on its most recent response. Diverges from the local
+// rate.Limiter when other clients spend the user's quota outside
+// decypharr (manual API calls, parallel deployments, etc).
+type ObservedQuota struct {
+	Limit      int       // X-RateLimit-Limit — capacity reported by server
+	Remaining  int       // X-RateLimit-Remaining — tokens left in the bucket
+	ResetAt    time.Time // X-RateLimit-Reset (epoch) or now + Retry-After
+	ObservedAt time.Time // when we received this header
+}
+
+// RateLimitObserver is an optional capability for providers that capture
+// the server-authoritative rate-limit state from response headers.
+// Manager.SubmitQuotas type-asserts this and, when present, prefers the
+// observed values over the local *rate.Limiter (which is just a
+// client-side guess). Providers that don't expose rate-limit headers
+// simply don't implement this interface.
+type RateLimitObserver interface {
+	ObservedQuotas() map[string]ObservedQuota
 }
 
 // UsenetClient is an optional capability interface implemented by debrid

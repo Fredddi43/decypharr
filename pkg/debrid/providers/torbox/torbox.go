@@ -27,6 +27,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/debrid/account"
+	"github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/version"
 	"go.uber.org/ratelimit"
@@ -49,6 +50,16 @@ type Torbox struct {
 	submitClientUsenet    *request.Client // for /api/usenet/createusenetdownload — independent bucket from submitClient since TorBox may or may not share the quota server-side
 	submitLimiter         *rate.Limiter   // kept alongside submitClient so SubmitLimiters() can expose live token state to the dashboard gauges
 	submitLimiterUsenet   *rate.Limiter   // ditto, for the usenet submit bucket
+
+	// observedQuotas captures the server-authoritative rate-limit state
+	// TorBox reports via X-RateLimit-* headers on every submit response
+	// (success or 429). The dashboard prefers these over the local
+	// limiter so the gauge reflects the real account quota — including
+	// drain from other clients hitting the same TorBox key. Key is
+	// "torrent" / "usenet".
+	observedQuotasMu sync.RWMutex
+	observedQuotas   map[string]common.ObservedQuota
+
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
@@ -211,6 +222,13 @@ func (tb *Torbox) doPostFormVia(c *request.Client, endpoint string, formData map
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// Capture server-authoritative rate-limit state from headers if
+	// present (TorBox returns these on both success and 429 responses).
+	// The dashboard prefers this over the local limiter so the gauge
+	// reflects the real account quota — including drain from other
+	// clients hitting the same key.
+	tb.recordRateLimitForClient(c, resp)
 
 	// Decode into result on any status code that has a body. TorBox returns
 	// a wrapped JSON shape (Success/Error/Detail/Data) even on non-2xx
@@ -997,6 +1015,83 @@ func (tb *Torbox) SubmitLimiters() map[string]*rate.Limiter {
 	return out
 }
 
+// recordRateLimitForClient parses X-RateLimit-* / Retry-After headers
+// from a submit response and stashes the result by API key. No-op when
+// the response has no rate-limit headers (provider hasn't surfaced
+// them yet, or the request never reached the server). Logs the first
+// observation per API at DEBUG level so we can confirm TorBox actually
+// emits these in the wild.
+func (tb *Torbox) recordRateLimitForClient(c *request.Client, resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	api := ""
+	switch c {
+	case tb.submitClient:
+		api = "torrent"
+	case tb.submitClientUsenet:
+		api = "usenet"
+	default:
+		return
+	}
+	rem := resp.Header.Get("X-RateLimit-Remaining")
+	lim := resp.Header.Get("X-RateLimit-Limit")
+	reset := resp.Header.Get("X-RateLimit-Reset")
+	retryAfter := resp.Header.Get("Retry-After")
+	if rem == "" && lim == "" && reset == "" && retryAfter == "" {
+		return
+	}
+	obs := common.ObservedQuota{ObservedAt: time.Now()}
+	if v, err := strconv.Atoi(rem); err == nil {
+		obs.Remaining = v
+	}
+	if v, err := strconv.Atoi(lim); err == nil {
+		obs.Limit = v
+	}
+	if reset != "" {
+		if epoch, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			obs.ResetAt = time.Unix(epoch, 0)
+		}
+	} else if retryAfter != "" {
+		if secs, err := strconv.Atoi(retryAfter); err == nil {
+			obs.ResetAt = time.Now().Add(time.Duration(secs) * time.Second)
+		}
+	}
+
+	tb.observedQuotasMu.Lock()
+	if tb.observedQuotas == nil {
+		tb.observedQuotas = make(map[string]common.ObservedQuota)
+	}
+	firstTime := tb.observedQuotas[api].ObservedAt.IsZero()
+	tb.observedQuotas[api] = obs
+	tb.observedQuotasMu.Unlock()
+
+	if firstTime {
+		tb.logger.Debug().
+			Str("api", api).
+			Int("limit", obs.Limit).
+			Int("remaining", obs.Remaining).
+			Time("reset_at", obs.ResetAt).
+			Msg("First observed rate-limit headers from TorBox")
+	}
+}
+
+// ObservedQuotas implements common.RateLimitObserver. Returns a copy of
+// the latest per-API observation. Manager.SubmitQuotas prefers these
+// over the local *rate.Limiter when present + recent.
+func (tb *Torbox) ObservedQuotas() map[string]common.ObservedQuota {
+	tb.observedQuotasMu.RLock()
+	defer tb.observedQuotasMu.RUnlock()
+	if len(tb.observedQuotas) == 0 {
+		return nil
+	}
+	out := make(map[string]common.ObservedQuota, len(tb.observedQuotas))
+	for k, v := range tb.observedQuotas {
+		out[k] = v
+	}
+	return out
+}
+
 // --- TorBox Usenet integration ---------------------------------------
 //
 // These methods call TorBox's /api/usenet/* endpoints. They MUST NOT
@@ -1053,6 +1148,9 @@ func (tb *Torbox) doSubmitPostMultipart(endpoint, fileFieldName, fileName string
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// Capture server-authoritative rate-limit state (see doPostFormVia).
+	tb.recordRateLimitForClient(tb.submitClientUsenet, resp)
 
 	if result != nil && resp.ContentLength != 0 {
 		if err := json.ConfigDefault.NewDecoder(resp.Body).Decode(result); err != nil {

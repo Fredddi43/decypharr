@@ -662,15 +662,46 @@ class DecypharrUtils {
         };
     }
 
-    // Copy to clipboard utility
+    // Copy to clipboard utility.
+    //
+    // Tries navigator.clipboard.writeText first — modern, async, but
+    // gated to secure contexts (HTTPS or localhost). On LAN/HTTP
+    // deployments the call throws and the user is stuck. Fall back to
+    // the legacy textarea+execCommand trick which works in HTTP.
     async copyToClipboard(text) {
+        // Path 1: modern Clipboard API (HTTPS / localhost only)
+        if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
+            try {
+                await navigator.clipboard.writeText(text);
+                this.createToast('Copied to clipboard', 'success');
+                return true;
+            } catch (error) {
+                console.warn('Clipboard API failed, falling back:', error);
+            }
+        }
+        // Path 2: legacy fallback. Inserts a hidden textarea, selects,
+        // execCommand('copy'). Works in HTTP-served contexts.
         try {
-            await navigator.clipboard.writeText(text);
-            this.createToast('Copied to clipboard', 'success');
-            return true;
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.top = '0';
+            ta.style.left = '0';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            if (ok) {
+                this.createToast('Copied to clipboard', 'success');
+                return true;
+            }
+            throw new Error('execCommand returned false');
         } catch (error) {
             console.error('Failed to copy to clipboard:', error);
-            this.createToast('Failed to copy to clipboard', 'error');
+            this.createToast('Failed to copy. Select and copy manually.', 'error');
             return false;
         }
     }

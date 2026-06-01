@@ -648,13 +648,18 @@ func (m *Manager) ResearchEntry(entry *storage.Entry) (bool, bool) {
 // GET /api/debrids/{name}/quotas. The dashboard renders a radial-progress
 // per (debrid, api) using TokensAvailable / Capacity. RefillPerSecond lets
 // the UI render a "next slot in Ns" countdown without polling the API
-// faster than necessary.
+// faster than necessary. Source indicates whether the numbers come from
+// the local rate.Limiter (estimate) or server-issued headers
+// (authoritative).
 type SubmitQuotaInfo struct {
-	API             string  `json:"api"`               // "torrent" or "usenet"
-	Configured      string  `json:"configured"`        // raw config string ("60/hour", etc.)
-	Capacity        int     `json:"capacity"`          // burst size (max tokens)
-	TokensAvailable float64 `json:"tokens_available"` // current refill state
-	RefillPerSecond float64 `json:"refill_per_second"` // tokens added per second
+	API             string  `json:"api"`                  // "torrent" or "usenet"
+	Configured      string  `json:"configured"`           // raw config string ("60/hour", etc.)
+	Capacity        int     `json:"capacity"`             // burst size (max tokens)
+	TokensAvailable float64 `json:"tokens_available"`     // current refill state
+	RefillPerSecond float64 `json:"refill_per_second"`    // tokens added per second
+	Source          string  `json:"source"`               // "observed" if from server headers; "local" if from rate.Limiter
+	ResetAt         int64   `json:"reset_at,omitempty"`   // unix epoch when the observed bucket refills (0 when source=local)
+	ObservedAgeSecs int     `json:"observed_age_secs,omitempty"` // seconds since the observation was captured
 }
 
 // SubmitQuotas returns the current submit-bucket state for each API on a
@@ -674,9 +679,21 @@ func (m *Manager) SubmitQuotas(name string) ([]SubmitQuotaInfo, error) {
 	if cfg.SupportsUsenet {
 		apis = append(apis, "usenet")
 	}
+
+	// Prefer server-observed values when a provider implements
+	// RateLimitObserver and has a recent observation. Observations
+	// older than the reset time are stale — fall back to the local
+	// limiter in that case (since the server bucket should have
+	// refilled by then).
+	var observed map[string]debrid.ObservedQuota
+	if obs, ok := client.(debrid.RateLimitObserver); ok {
+		observed = obs.ObservedQuotas()
+	}
+
 	out := make([]SubmitQuotaInfo, 0, len(apis))
+	now := time.Now()
 	for _, api := range apis {
-		info := SubmitQuotaInfo{API: api}
+		info := SubmitQuotaInfo{API: api, Source: "local"}
 		switch api {
 		case "torrent":
 			info.Configured = cfg.SubmitRateLimit
@@ -686,10 +703,27 @@ func (m *Manager) SubmitQuotas(name string) ([]SubmitQuotaInfo, error) {
 				info.Configured = cfg.SubmitRateLimit
 			}
 		}
+		// Local-limiter values come first (always present when
+		// configured). Server-observed values override when present
+		// and not yet expired.
 		if lim := limiters[api]; lim != nil {
 			info.Capacity = lim.Burst()
 			info.TokensAvailable = lim.Tokens()
 			info.RefillPerSecond = float64(lim.Limit())
+		}
+		if q, ok := observed[api]; ok && !q.ObservedAt.IsZero() {
+			fresh := q.ResetAt.IsZero() || q.ResetAt.After(now)
+			if fresh {
+				info.Source = "observed"
+				if q.Limit > 0 {
+					info.Capacity = q.Limit
+				}
+				info.TokensAvailable = float64(q.Remaining)
+				if !q.ResetAt.IsZero() {
+					info.ResetAt = q.ResetAt.Unix()
+				}
+				info.ObservedAgeSecs = int(now.Sub(q.ObservedAt).Seconds())
+			}
 		}
 		out = append(out, info)
 	}
