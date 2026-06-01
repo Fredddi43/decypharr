@@ -34,16 +34,20 @@ type Collector struct {
 	cancel context.CancelFunc
 }
 
-// New creates a Collector and starts the background refresh goroutine.
+// New creates a Collector. Does NOT block on the initial snapshot —
+// collect() fetches debrid profiles via HTTP and would stall the server
+// boot when a provider's key is misconfigured or the API is slow. The
+// background loop produces the first real snapshot; until then,
+// Snapshot() serves the empty zero value (which the dashboard handles
+// gracefully).
 func New(mgr *manager.Manager) *Collector {
 	c := &Collector{
 		mgr:          mgr,
 		logger:       logger.New("stats"),
 		profileCache: make(map[string]*debridTypes.Profile),
 		profileTTL:   60 * time.Second,
+		snapshot:     &Snapshot{}, // empty until first loop tick
 	}
-	// Build an initial snapshot synchronously so the first request is served immediately.
-	c.snapshot = c.collect()
 	return c
 }
 
@@ -75,8 +79,16 @@ func (c *Collector) Handler() http.HandlerFunc {
 	}
 }
 
-// loop refreshes the snapshot on a timer.
+// loop refreshes the snapshot on a timer. Fires once immediately so the
+// dashboard has data within seconds of boot, then every 5s after that.
 func (c *Collector) loop(ctx context.Context) {
+	refresh := func() {
+		snap := c.collect()
+		c.mu.Lock()
+		c.snapshot = snap
+		c.mu.Unlock()
+	}
+	refresh() // initial snapshot — happens AFTER server.Start, so a hang here doesn't block boot
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -84,10 +96,7 @@ func (c *Collector) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			snap := c.collect()
-			c.mu.Lock()
-			c.snapshot = snap
-			c.mu.Unlock()
+			refresh()
 		}
 	}
 }

@@ -71,6 +71,7 @@ type Server struct {
 
 func New(mgr *manager.Manager) *Server {
 	l := logger.New("http")
+	l.Info().Msg("[boot] server.New: parsing templates")
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.StripSlashes)
@@ -92,6 +93,7 @@ func New(mgr *manager.Manager) *Server {
 		"templates/register.html",
 		"templates/setup.html",
 	))
+	l.Info().Msg("[boot] server.New: templates parsed, building cookie store + stats collector")
 	cookieStore := sessions.NewCookieStore([]byte(cfg.SecretKey()))
 	cookieStore.Options = &sessions.Options{
 		Path:     "/",
@@ -100,6 +102,7 @@ func New(mgr *manager.Manager) *Server {
 	}
 
 	statsCollector := stats.New(mgr)
+	l.Info().Msg("[boot] server.New: stats collector built, wiring qbit/sabnzbd/webdav routes")
 
 	s := &Server{
 		logger:    l,
@@ -155,6 +158,7 @@ func New(mgr *manager.Manager) *Server {
 		r.Post("/webhooks/tautulli", s.handleTautulli)
 	})
 	s.router = r
+	l.Info().Msg("[boot] server.New: routes wired, returning Server")
 	return s
 }
 
@@ -174,7 +178,7 @@ func (s *Server) Restart() {
 func (s *Server) Start(ctx context.Context) error {
 	cfg := config.Get()
 
-	// Start background stats collector
+	s.logger.Info().Msg("[boot] server.Start: launching stats collector")
 	s.stats.Start(ctx)
 
 	addr := fmt.Sprintf("%s:%s", cfg.BindAddress, cfg.Port)

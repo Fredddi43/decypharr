@@ -64,10 +64,16 @@ func Start(ctx context.Context) error {
 +-------------------------------------------------------+
 `, version.GetInfo(), cfg.LogLevel)
 
-		// Initialize services
+		// Initialize services. Each stage is logged so a hang (silent
+		// goroutine deadlock, slow provider API, etc.) is attributable
+		// to a specific construct call rather than "decypharr stopped
+		// printing".
+		_log.Info().Msgf("[boot] creating mount manager (type=%s)", cfg.Mount.Type)
 		mountMgr := createMountManager(mgr, cfg)
 		mgr.SetMountManager(mountMgr)
+		_log.Info().Msg("[boot] building HTTP server")
 		srv := server.New(mgr)
+		_log.Info().Msg("[boot] HTTP server built; wiring restart hook")
 
 		srv.SetRestartFunc(restartFunc)
 
@@ -92,6 +98,7 @@ func Start(ctx context.Context) error {
 			runtime.GC()
 		}
 
+		_log.Info().Msg("[boot] launching service goroutines (server + manager)")
 		done := make(chan struct{})
 		go func(ctx context.Context) {
 			if err := startServices(ctx, mgr, cancelSvc, srv); err != nil {
