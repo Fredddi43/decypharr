@@ -460,9 +460,19 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		newConfig.Port = "8282"
 	}
 
-	// Preserve fields that shouldn't be overwritten by frontend
+	// Preserve fields that shouldn't be overwritten by frontend.
+	//
+	// UseAuth is preserved explicitly because the dashboard's Save
+	// button submits a serialised config blob built from form inputs,
+	// and there is no `use_auth` form field. Without this line, the
+	// JSON decode lands on a zero-value `false`, Save persists that
+	// (or strips it as omitempty), and the next restart loads with
+	// auth disabled — the LAN dashboard goes wide open silently. The
+	// loadConfig fatal check at end-of-loadConfig now catches that
+	// regression at boot, but preserving here is the actual fix.
 	currentConfig := config.Get()
 	newConfig.Auth = currentConfig.GetAuth()
+	newConfig.UseAuth = currentConfig.UseAuth
 
 	// Filter out empty or incomplete arrs
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))

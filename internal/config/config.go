@@ -178,7 +178,7 @@ type Config struct {
 	MaxFileSize        string   `json:"max_file_size,omitempty"`
 	RemoveStalledAfter string   `json:"remove_stalled_after,omitzero"`
 	EnableWebdavAuth   bool     `json:"enable_webdav_auth,omitempty"`
-	UseAuth            bool     `json:"use_auth,omitempty"`
+	UseAuth            bool     `json:"use_auth"`
 	NZBUserAgent       string   `json:"nzb_user_agent,omitempty"` // User agent for downloading NZBs
 	Auth               *Auth    `json:"-"`
 
@@ -307,6 +307,17 @@ func (c *Config) loadConfig() error {
 
 	// Apply environment variable overrides
 	c.applyEnvOverrides()
+
+	// Auth is mandatory. The dashboard + API expose torrent state,
+	// arr API tokens, and debrid credentials — none of which can be
+	// safely served on an unauthenticated endpoint. A prior regression
+	// (handleUpdateConfig dropping UseAuth on Save) silently flipped
+	// this off after every config-page save + restart, leaving the LAN
+	// dashboard wide open. Refuse to start in that state so the
+	// regression is loud, not silent.
+	if !c.UseAuth && !parseBool(getEnv("ALLOW_UNAUTH")) {
+		return fmt.Errorf("use_auth is disabled in %s; decypharr refuses to start without user authentication. set \"use_auth\": true and configure credentials via /setup or /register. to override for local dev, set DECYPHARR_ALLOW_UNAUTH=true", configFile)
+	}
 
 	return nil
 }
@@ -747,6 +758,10 @@ func (c *Config) Save() error {
 		fmt.Printf("Failed to write config file: %v\n", err)
 		return err
 	}
+	// Audit: every save logs the resulting auth state so a future
+	// regression that flips UseAuth off is immediately visible in
+	// docker logs without having to diff config.json.
+	fmt.Printf("config saved (use_auth=%v)\n", c.UseAuth)
 	return nil
 }
 

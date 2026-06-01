@@ -133,29 +133,37 @@ func (s *Server) setupCompleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 1: Handle Authentication
+	// Step 1: Handle Authentication.
+	//
+	// SkipAuth is no longer honoured — auth is mandatory across the
+	// installation. The legacy field stays on the request DTO so old
+	// setup forms don't fail to decode, but selecting it is an error.
 	if req.Auth.SkipAuth {
-		cfg.UseAuth = false
-	} else if req.Auth.Username != "" && req.Auth.Password != "" {
-		auth := cfg.GetAuth()
-		if auth == nil {
-			auth = &config.Auth{}
-		}
-		auth.Username = req.Auth.Username
+		s.sendSetupError(w, "auth is mandatory; please configure credentials instead of skipping", nil)
+		return
+	}
+	if req.Auth.Username == "" || req.Auth.Password == "" {
+		s.sendSetupError(w, "username and password are required", nil)
+		return
+	}
+	auth := cfg.GetAuth()
+	if auth == nil {
+		auth = &config.Auth{}
+	}
+	auth.Username = req.Auth.Username
 
-		// Hash password using bcrypt
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Auth.Password), bcrypt.DefaultCost)
-		if err != nil {
-			s.sendSetupError(w, "Failed to hash password", err)
-			return
-		}
-		auth.Password = string(hashedPassword)
+	// Hash password using bcrypt
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Auth.Password), bcrypt.DefaultCost)
+	if err != nil {
+		s.sendSetupError(w, "Failed to hash password", err)
+		return
+	}
+	auth.Password = string(hashedPassword)
 
-		cfg.UseAuth = true
-		if err := cfg.SaveAuth(auth); err != nil {
-			s.sendSetupError(w, "Failed to save authentication", err)
-			return
-		}
+	cfg.UseAuth = true
+	if err := cfg.SaveAuth(auth); err != nil {
+		s.sendSetupError(w, "Failed to save authentication", err)
+		return
 	}
 
 	// Step 2: Handle Debrid Provider (optional)

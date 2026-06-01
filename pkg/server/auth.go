@@ -28,19 +28,11 @@ func (s *Server) verifyAuth(username, password string) bool {
 }
 
 func (s *Server) skipAuthHandler(w http.ResponseWriter, r *http.Request) {
-	cfg := config.Get()
-	// Only allow skipping auth during initial setup (before setup is complete)
-	if err := cfg.SetupComplete(); err == nil {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	cfg.UseAuth = false
-	if err := cfg.Save(); err != nil {
-		s.logger.Error().Err(err).Msg("failed to save config")
-		http.Error(w, "failed to save config", http.StatusInternalServerError)
-		return
-	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	// Auth is mandatory; the "skip auth" path was an old foot-gun that
+	// silently disabled credentials on initial setup. The route is
+	// retained so old form submissions don't 404, but it always
+	// refuses.
+	http.Error(w, "auth is mandatory; cannot skip", http.StatusForbidden)
 }
 
 // isValidAPIToken checks if the request contains a valid API token
