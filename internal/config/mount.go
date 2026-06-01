@@ -83,6 +83,29 @@ type Mount struct {
 }
 
 func (c *Config) applyMountEnvVars() {
+	// Mount type + path. Allows selecting the mount backend (rclone, dfs,
+	// external_rclone, none) and the logical mount path purely via env, so a
+	// container can be switched to a host/sidecar-managed mount without editing
+	// config.json. The mount path still drives symlink target computation even
+	// in external_rclone mode (see manager.GetTorrentMountPath).
+	if val := getEnv("MOUNT__TYPE"); val != "" {
+		c.Mount.Type = MountType(val)
+	}
+	if val := getEnv("MOUNT__MOUNT_PATH"); val != "" {
+		c.Mount.MountPath = val
+	}
+	// External rclone: point decypharr at an rclone RC API owned by a separate
+	// process (host service or sidecar container) that performs the FUSE mount.
+	// decypharr then only serves WebDAV and forwards VFS-refresh calls.
+	if val := getEnv("MOUNT__EXTERNAL_RCLONE__RC_URL"); val != "" {
+		c.Mount.ExternalRclone.RCUrl = val
+	}
+	if val := getEnv("MOUNT__EXTERNAL_RCLONE__RC_USERNAME"); val != "" {
+		c.Mount.ExternalRclone.RCUsername = val
+	}
+	if val := getEnv("MOUNT__EXTERNAL_RCLONE__RC_PASSWORD"); val != "" {
+		c.Mount.ExternalRclone.RCPassword = val
+	}
 	// DFS settings
 	if val := getEnv("MOUNT__DFS__CACHE_DIR"); val != "" {
 		c.Mount.DFS.CacheDir = val
