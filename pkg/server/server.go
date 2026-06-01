@@ -123,7 +123,13 @@ func New(mgr *manager.Manager) *Server {
 	if !wd.IsDisabled() {
 		routes["/webdav"] = wd.Routes()
 	}
-	routes["/sabnzbd"] = sb.Routes()
+	// Mount under both the canonical /sabnzbd (real SABnzbd) and the
+	// /sabnzb alias. Users typing the URL Base into Sonarr by hand have
+	// shipped /sabnzb (missing the trailing d) often enough to warrant
+	// the cheap defensive alias.
+	sabRoutes := sb.Routes()
+	routes["/sabnzbd"] = sabRoutes
+	routes["/sabnzb"] = sabRoutes
 
 	// Trim trailing slash so chi registers the URLBase root path itself
 	routePath := cfg.URLBase

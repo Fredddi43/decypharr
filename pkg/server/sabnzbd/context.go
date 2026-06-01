@@ -84,23 +84,83 @@ func (s *SABnzbd) modeContext(next http.Handler) http.Handler {
 	})
 }
 
-// authContext creates a middleware that extracts the Arr host and token from the Authorization header
-// and adds it to the request context.
-// This is used to identify the Arr instance for the request.
-// Only a valid host and token will be added to the context/config. The rest are manual
+// authContext authenticates the SAB-compat request and binds the
+// resolved arr to the context. Two paths, tried in order:
+//
+//  1. **decypharr-bearer (preferred)**: arr's SAB-client form sends
+//     `apikey=<decypharr Bearer token>` (or `Authorization: Bearer
+//     <token>` header). The arr identity is derived from the SAB
+//     `cat`/`category` query param matched against decypharr's
+//     configured arr list. This mirrors what real SABnzbd does and
+//     gives the user a single shared credential across all surfaces
+//     (dashboard, qbit-compat, SAB-compat).
+//
+//  2. **legacy ma_username/ma_password**: arr sends its own host +
+//     API key as SAB's "MyAccount" username/password. Kept for
+//     back-compat with anyone already using this path.
+//
+// On success, the resolved *arr.Arr lands in the request context for
+// downstream handlers. On failure, returns 401 with a message that
+// explains both options so the operator can fix their SAB-client form.
 func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := config.Get()
+
+		// Path 1: decypharr Bearer via apikey query OR Authorization header.
+		apikey := r.URL.Query().Get("apikey")
+		if apikey == "" {
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				apikey = strings.TrimPrefix(h, "Bearer ")
+			} else if strings.HasPrefix(h, "Token ") {
+				apikey = strings.TrimPrefix(h, "Token ")
+			}
+		}
+		if apikey != "" && cfg.UseAuth {
+			if authCfg := cfg.GetAuth(); authCfg != nil && authCfg.APIToken != "" && apikey == authCfg.APIToken {
+				category := getCategory(r.Context())
+				a := s.resolveArrByCategory(category)
+				if a == nil {
+					http.Error(w, fmt.Sprintf("unknown category %q — add this arr under Providers → Arrs in decypharr settings", category), http.StatusBadRequest)
+					return
+				}
+				ctx := context.WithValue(r.Context(), arrKey, a)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+		}
+
+		// Path 2: legacy ma_username/ma_password (arr's own credentials).
 		host := r.URL.Query().Get("ma_username")
 		token := r.URL.Query().Get("ma_password")
 		category := getCategory(r.Context())
 		a, err := s.authenticate(category, host, token)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
+			http.Error(w, err.Error()+" (also accepted: apikey=<decypharr API token> via query string or `Authorization: Bearer ...` header)", http.StatusUnauthorized)
 			return
 		}
 		ctx := context.WithValue(r.Context(), arrKey, a)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// resolveArrByCategory looks up an arr by name — either the live
+// runtime entry or, failing that, a configured-but-not-yet-validated
+// entry from config.json. Returns nil if no match.
+func (s *SABnzbd) resolveArrByCategory(category string) *arr.Arr {
+	if category == "" {
+		return nil
+	}
+	if a := s.manager.Arr().Get(category); a != nil {
+		return a
+	}
+	for _, cfgArr := range config.Get().Arrs {
+		if cfgArr.Name == category {
+			a := arr.New(cfgArr.Name, cfgArr.Host, cfgArr.Token, cfgArr.Cleanup, cfgArr.SkipRepair, cfgArr.DownloadUncached, cfgArr.SelectedDebrid, cfgArr.Source)
+			s.manager.Arr().AddOrUpdate(a)
+			return a
+		}
+	}
+	return nil
 }
 
 func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, error) {
